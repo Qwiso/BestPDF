@@ -32,6 +32,27 @@ pub const ZOOM_MAX: f32 = 2.50;
 /// Pages bigger than this many pixels are rendered only around what's on
 /// screen, so high zoom doesn't need hundreds of MB per page.
 const WHOLE_PAGE_PIXELS: i64 = 8_000_000;
+/// Undo steps kept per tab.
+const UNDO_LIMIT: usize = 200;
+
+/// A change to the page list. Applying one returns the change that undoes
+/// it, so history holds small operations instead of copies of the file.
+pub enum PageOp {
+    /// Move page `from` so it ends up at index `to`.
+    Move { from: usize, to: usize },
+    /// Insert the only page of `page` at index `at`.
+    Insert { at: usize, page: Document },
+    Delete { at: usize },
+    /// Quarter turns clockwise (negative: counterclockwise).
+    Rotate { page: usize, quarters: i32 },
+}
+
+/// One undo (or redo) step: the overlays to go back to, and the page change
+/// that undoes the page edit, if there was one.
+struct Step {
+    overlays: Vec<Overlay>,
+    page: Option<PageOp>,
+}
 
 pub struct Tab {
     pub doc: Document,
@@ -47,6 +68,13 @@ pub struct Tab {
     pub selected: Option<usize>,
     /// While typing into the selected text overlay: caret byte offset.
     pub caret: Option<usize>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
+    /// Overlays as they were when the change in progress (a drag, a typing
+    /// session) began; recorded as one undo step when it ends.
+    pending: Option<Vec<Overlay>>,
+    /// Bumped whenever the pages change (search results go stale).
+    pub generation: u64,
     layout: Layout,
     pages: HashMap<usize, PageBitmap>,
     thumbs: HashMap<usize, PageBitmap>,
@@ -64,6 +92,10 @@ impl Tab {
             overlays: Vec::new(),
             selected: None,
             caret: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            pending: None,
+            generation: 0,
             layout: Layout::default(),
             pages: HashMap::new(),
             thumbs: HashMap::new(),
@@ -81,6 +113,7 @@ impl Tab {
     /// Call after the page list changes: pages are re-laid out and re-rendered.
     pub fn pages_changed(&mut self) {
         self.dirty = true;
+        self.generation += 1;
         self.layout = Layout::default();
         self.pages.clear();
         self.thumbs.clear();
@@ -88,26 +121,183 @@ impl Tab {
 
     /// After a save: the file was reloaded, so overlays saved as stamps come
     /// back from it as pages render again.
+    /// History is dropped too: the reloaded file now holds the overlays, and
+    /// older steps would bring back copies of them.
     pub fn reloaded(&mut self) {
         self.overlays.clear();
         self.selected = None;
         self.caret = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.pending = None;
         self.pages.clear();
         self.thumbs.clear();
     }
 
+    // ---- undo ----------------------------------------------------------------
+
+    fn push_undo(&mut self, step: Step) {
+        self.undo.push(step);
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Marks the start of an overlay change (call before changing them).
+    pub fn begin_change(&mut self) {
+        if self.pending.is_none() {
+            self.pending = Some(self.overlays.clone());
+        }
+    }
+
+    /// Records the change since `begin_change` as one undo step, if anything changed.
+    pub fn end_change(&mut self) {
+        if let Some(before) = self.pending.take() {
+            if before != self.overlays {
+                self.dirty = true;
+                self.push_undo(Step { overlays: before, page: None });
+            }
+        }
+    }
+
+    /// An overlay change made in one go.
+    pub fn change(&mut self, f: impl FnOnce(&mut Self)) {
+        self.begin_change();
+        f(self);
+        self.end_change();
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Undoes (or with `redo`, redoes) one step. Ok(false) if there was none.
+    pub fn undo(&mut self, redo: bool) -> Result<bool, String> {
+        self.end_edit(); // a typing session in progress becomes its own step first
+        self.end_change();
+        let Some(step) = (if redo { self.redo.pop() } else { self.undo.pop() }) else { return Ok(false) };
+        let had_page_op = step.page.is_some();
+        let back_page = match step.page {
+            Some(op) => match self.apply(op) {
+                Ok(inverse) => Some(inverse),
+                Err(e) => return Err(e),
+            },
+            None => None,
+        };
+        let now = std::mem::replace(&mut self.overlays, step.overlays);
+        let back = Step { overlays: now, page: back_page };
+        if redo { self.undo.push(back) } else { self.redo.push(back) }
+        self.selected = None;
+        self.caret = None;
+        if had_page_op {
+            self.pages_changed();
+        }
+        self.dirty = true;
+        Ok(true)
+    }
+
+    // ---- page edits ------------------------------------------------------------
+
+    /// Applies a page change to the document only; returns its inverse.
+    fn apply(&mut self, op: PageOp) -> Result<PageOp, String> {
+        Ok(match op {
+            PageOp::Move { from, to } => {
+                self.doc.move_page(from, to)?;
+                PageOp::Move { from: to, to: from }
+            }
+            PageOp::Insert { at, page } => {
+                self.doc.import_page(&page, 0, at)?;
+                PageOp::Delete { at }
+            }
+            PageOp::Delete { at } => {
+                let page = Document::from_page(&self.doc, at)?;
+                self.doc.delete_page(at);
+                PageOp::Insert { at, page }
+            }
+            PageOp::Rotate { page, quarters } => {
+                self.doc.rotate_page(page, quarters)?;
+                PageOp::Rotate { page, quarters: -quarters }
+            }
+        })
+    }
+
+    /// Makes a page edit the user asked for: changes the document, carries
+    /// the overlays along, and records it for undo.
+    pub fn page_edit(&mut self, op: PageOp) -> Result<(), String> {
+        self.end_edit();
+        self.end_change();
+        let before = self.overlays.clone();
+        let size = match &op {
+            PageOp::Rotate { page, .. } => self.doc.page_sizes.get(*page).copied(),
+            _ => None,
+        };
+        let follow: Box<dyn Fn(&mut Overlay) -> bool> = match &op {
+            &PageOp::Move { from, to } => Box::new(move |o| {
+                o.page = match o.page {
+                    p if p == from => to,
+                    p if from < to && p > from && p <= to => p - 1,
+                    p if to < from && p >= to && p < from => p + 1,
+                    p => p,
+                };
+                true
+            }),
+            &PageOp::Insert { at, .. } => Box::new(move |o| {
+                if o.page >= at {
+                    o.page += 1;
+                }
+                true
+            }),
+            &PageOp::Delete { at } => Box::new(move |o| {
+                if o.page > at {
+                    o.page -= 1;
+                }
+                o.page != at
+            }),
+            &PageOp::Rotate { page, quarters } => Box::new(move |o| {
+                if o.page == page {
+                    rotate_overlay(o, size.unwrap_or((612.0, 792.0)), quarters);
+                }
+                true
+            }),
+        };
+        let inverse = self.apply(op)?;
+        self.overlays.retain_mut(|o| follow(o));
+        self.selected = None;
+        self.push_undo(Step { overlays: before, page: Some(inverse) });
+        self.pages_changed();
+        Ok(())
+    }
+
     // ---- overlays ----------------------------------------------------------
 
-    /// Stops typing; a text box left empty is removed.
+    /// Starts typing into text overlay `i`. `base` is how the overlays looked
+    /// before (without the box, if it was just made) for undo.
+    pub fn start_edit(&mut self, base: Vec<Overlay>, i: usize, caret: usize) {
+        self.end_edit();
+        self.end_change();
+        self.pending = Some(base);
+        self.selected = Some(i);
+        self.caret = Some(caret);
+    }
+
+    /// Stops typing; a text box left empty is removed. The session becomes
+    /// one undo step.
     pub fn end_edit(&mut self) {
         if self.caret.take().is_none() {
             return;
         }
-        let Some(i) = self.selected else { return };
-        if matches!(&self.overlays[i].kind, Kind::Text { text, .. } if text.trim().is_empty()) {
-            self.overlays.remove(i);
-            self.selected = None;
+        if let Some(i) = self.selected {
+            if matches!(&self.overlays[i].kind, Kind::Text { text, .. } if text.trim().is_empty()) {
+                self.overlays.remove(i);
+                self.selected = None;
+            }
         }
+        self.end_change();
     }
 
     /// Runs `f` on the text being edited and its caret (byte offset). `f`
@@ -126,10 +316,11 @@ impl Tab {
 
     pub fn remove_overlay(&mut self, i: usize) {
         if i < self.overlays.len() {
-            self.overlays.remove(i);
+            self.end_edit();
+            self.change(|t| {
+                t.overlays.remove(i);
+            });
             self.selected = None;
-            self.caret = None;
-            self.dirty = true;
         }
     }
 
@@ -138,21 +329,8 @@ impl Tab {
         self.overlays.iter().filter(|o| o.page == page).cloned().collect()
     }
 
-    /// Re-indexes overlays after the page list changed: `f` maps an old page
-    /// index to its new one, or None if the page is gone.
-    pub fn remap_overlays(&mut self, f: impl Fn(usize) -> Option<usize>) {
-        self.end_edit();
-        self.selected = None;
-        self.overlays.retain_mut(|o| match f(o.page) {
-            Some(p) => {
-                o.page = p;
-                true
-            }
-            None => false,
-        });
-    }
-
-    /// Adds copies of overlays onto page `page`.
+    /// Adds copies of overlays onto page `page` (part of the page edit just
+    /// made, so not a separate undo step).
     pub fn add_overlays(&mut self, copies: Vec<Overlay>, page: usize) {
         self.overlays.extend(copies.into_iter().map(|o| Overlay { page, ..o }));
     }
@@ -302,4 +480,20 @@ impl Tab {
         self.pages.retain(|&i, _| keep(&pages, i));
         self.thumbs.retain(|&i, _| keep(&thumbs, i));
     }
+}
+
+/// Moves an overlay with its page turning `quarters` quarter turns clockwise.
+/// `(pw, ph)` is the page's displayed size before turning. Overlays stay
+/// upright; marks turn with the area they cover.
+fn rotate_overlay(o: &mut Overlay, (mut pw, mut ph): (f32, f32), quarters: i32) {
+    for _ in 0..quarters.rem_euclid(4) {
+        let (cx, cy) = (o.x + o.w / 2.0, o.y + o.h / 2.0);
+        let (ncx, ncy) = (ph - cy, cx);
+        if matches!(o.kind, Kind::Mark(_)) {
+            (o.w, o.h) = (o.h, o.w);
+        }
+        (o.x, o.y) = (ncx - o.w / 2.0, ncy - o.h / 2.0);
+        (pw, ph) = (ph, pw);
+    }
+    let _ = pw;
 }

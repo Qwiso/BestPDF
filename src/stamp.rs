@@ -9,7 +9,9 @@
 
 use std::ffi::{c_int, c_uint};
 
-use crate::overlay::{Image, Kind, Overlay, ASCENT, HIGHLIGHT, LINE};
+use std::collections::HashMap;
+
+use crate::overlay::{self, Family, Image, Kind, Mark, MarkStyle, Overlay, TextStyle, LINE};
 use crate::pdfium::{self, api, FPDF_DOCUMENT, FPDF_FONT, FPDF_PAGE, FPDF_PAGEOBJECT, FS_MATRIX, FS_RECTF};
 
 /// Annotation key holding our metadata, e.g. "kind=text;size=14".
@@ -23,14 +25,14 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// Maps between display points (top-left origin) and page space for one page.
-struct PageMap {
+pub(crate) struct PageMap {
     page: FPDF_PAGE,
     w: c_int,
     h: c_int,
 }
 
 impl PageMap {
-    fn new(page: FPDF_PAGE, (pw, ph): (f32, f32)) -> Self {
+    pub(crate) fn new(page: FPDF_PAGE, (pw, ph): (f32, f32)) -> Self {
         Self { page, w: (pw * K) as c_int, h: (ph * K) as c_int }
     }
 
@@ -42,7 +44,7 @@ impl PageMap {
         (px, py)
     }
 
-    fn to_display(&self, px: f64, py: f64) -> (f32, f32) {
+    pub(crate) fn to_display(&self, px: f64, py: f64) -> (f32, f32) {
         let (mut x, mut y) = (0, 0);
         unsafe {
             (api().FPDF_PageToDevice)(self.page, 0, 0, self.w, self.h, 0, px, py, &mut x, &mut y);
@@ -73,43 +75,49 @@ impl PageMap {
     }
 }
 
-/// Fonts loaded into one document while writing overlays.
+/// Fonts loaded into one document while writing overlays, by
+/// (family, bold, italic, embedded).
 pub struct Fonts {
     doc: FPDF_DOCUMENT,
-    helvetica: Option<FPDF_FONT>,
-    arial: Option<FPDF_FONT>,
+    loaded: HashMap<(Family, bool, bool, bool), FPDF_FONT>,
 }
 
 impl Fonts {
     pub fn new(doc: FPDF_DOCUMENT) -> Self {
-        Self { doc, helvetica: None, arial: None }
+        Self { doc, loaded: HashMap::new() }
     }
 
-    /// Helvetica (built into every reader, nothing embedded) when the text fits
-    /// its encoding; otherwise Arial from Windows, embedded.
-    fn for_text(&mut self, text: &str) -> FPDF_FONT {
+    /// The standard PDF font (built into every reader, nothing embedded) when
+    /// the text fits its encoding; otherwise the matching Windows font, embedded.
+    fn for_text(&mut self, text: &str, style: &TextStyle) -> FPDF_FONT {
         let a = api();
+        let (doc, family, bold, italic) = (self.doc, style.family, style.bold, style.italic);
+        let standard = |fonts: &mut Self| {
+            *fonts.loaded.entry((family, bold, italic, false)).or_insert_with(|| unsafe {
+                (a.FPDFText_LoadStandardFont)(doc, family.pdf_name(bold, italic).as_ptr())
+            })
+        };
         if text.chars().all(in_win_ansi) {
-            return *self.helvetica.get_or_insert_with(|| unsafe { (a.FPDFText_LoadStandardFont)(self.doc, c"Helvetica".as_ptr()) });
+            return standard(self);
         }
-        if self.arial.is_none() {
+        let embedded = *self.loaded.entry((family, bold, italic, true)).or_insert_with(|| {
             let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
-            let path = std::path::Path::new(&windir).join("Fonts").join("arial.ttf");
-            let font = std::fs::read(path)
-                .map(|data| unsafe { (a.FPDFText_LoadFont)(self.doc, data.as_ptr(), data.len() as u32, pdfium::FPDF_FONT_TRUETYPE, 1) })
-                .unwrap_or(std::ptr::null_mut());
-            self.arial = Some(font);
-        }
-        match self.arial {
-            Some(f) if !f.is_null() => f,
-            _ => self.for_text(""),
+            let path = std::path::Path::new(&windir).join("Fonts").join(family.ttf(bold, italic));
+            std::fs::read(path)
+                .map(|data| unsafe { (a.FPDFText_LoadFont)(doc, data.as_ptr(), data.len() as u32, pdfium::FPDF_FONT_TRUETYPE, 1) })
+                .unwrap_or(std::ptr::null_mut())
+        });
+        if embedded.is_null() {
+            standard(self)
+        } else {
+            embedded
         }
     }
 }
 
 impl Drop for Fonts {
     fn drop(&mut self) {
-        for f in [self.helvetica, self.arial].into_iter().flatten() {
+        for &f in self.loaded.values() {
             if !f.is_null() {
                 unsafe { (api().FPDFFont_Close)(f) };
             }
@@ -129,27 +137,34 @@ fn build(doc: FPDF_DOCUMENT, map: &PageMap, o: &Overlay, fonts: &mut Fonts) -> V
     let mut objs = Vec::new();
     unsafe {
         match &o.kind {
-            Kind::Highlight => {
-                let r = (a.FPDFPageObj_CreateNewRect)(0.0, 0.0, o.w, o.h);
+            Kind::Mark(style) => {
+                // Box space has its origin at the bottom-left, so flip the bar's top.
+                let (y, h) = o.mark_bar().map_or((0.0, o.h), |(top, t)| (o.h - top - t, t));
+                let r = (a.FPDFPageObj_CreateNewRect)(0.0, y, o.w, h);
                 (a.FPDFPath_SetDrawMode)(r, pdfium::FPDF_FILLMODE_ALTERNATE, 0);
-                let (cr, cg, cb) = HIGHLIGHT;
-                (a.FPDFPageObj_SetFillColor)(r, cr as c_uint, cg as c_uint, cb as c_uint, 255);
-                (a.FPDFPageObj_SetBlendMode)(r, c"Multiply".as_ptr());
+                let (cr, cg, cb) = rgb(style.color);
+                (a.FPDFPageObj_SetFillColor)(r, cr, cg, cb, 255);
+                if style.mark == Mark::Highlight {
+                    (a.FPDFPageObj_SetBlendMode)(r, c"Multiply".as_ptr());
+                }
                 objs.push(r);
             }
-            Kind::Text { text, size } => {
-                let font = fonts.for_text(text);
+            Kind::Text { text, style } => {
+                let font = fonts.for_text(text, style);
+                let size = style.size;
+                let ascent = overlay::ascent(style);
+                let (cr, cg, cb) = rgb(style.color);
                 for (i, line) in text.split('\n').enumerate() {
                     if line.is_empty() {
                         continue;
                     }
-                    let t = (a.FPDFPageObj_CreateTextObj)(doc, font, *size);
+                    let t = (a.FPDFPageObj_CreateTextObj)(doc, font, size);
                     if t.is_null() {
                         continue;
                     }
                     (a.FPDFText_SetText)(t, wide(line).as_ptr());
-                    (a.FPDFPageObj_SetFillColor)(t, 0, 0, 0, 255);
-                    let baseline = o.h - (ASCENT + i as f32 * LINE) * size;
+                    (a.FPDFPageObj_SetFillColor)(t, cr, cg, cb, 255);
+                    let baseline = o.h - (ascent + i as f32 * LINE) * size;
                     (a.FPDFPageObj_Transform)(t, 1.0, 0.0, 0.0, 1.0, 0.0, baseline as f64);
                     objs.push(t);
                 }
@@ -175,10 +190,21 @@ fn build(doc: FPDF_DOCUMENT, map: &PageMap, o: &Overlay, fonts: &mut Fonts) -> V
     objs
 }
 
+fn rgb(color: u32) -> (c_uint, c_uint, c_uint) {
+    ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
+}
+
 fn meta(o: &Overlay) -> String {
     match &o.kind {
-        Kind::Text { size, .. } => format!("kind=text;size={size}"),
-        Kind::Highlight => "kind=highlight".into(),
+        Kind::Text { style: s, .. } => format!(
+            "kind=text;size={};font={};bold={};italic={};color={:06x}",
+            s.size,
+            s.family.key(),
+            s.bold as u8,
+            s.italic as u8,
+            s.color
+        ),
+        Kind::Mark(s) => format!("kind=mark;mark={};color={:06x}", s.mark.key(), s.color),
         Kind::Image(_) => "kind=image".into(),
     }
 }
@@ -251,13 +277,28 @@ pub fn take(doc: FPDF_DOCUMENT, page: FPDF_PAGE, index: usize, size: (f32, f32))
             let (x0, y0) = map.to_display(rect.left as f64, rect.top as f64);
             let (x1, y1) = map.to_display(rect.right as f64, rect.bottom as f64);
             let (x, y, w, h) = (x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs());
+            let color = field("color").and_then(|c| u32::from_str_radix(c, 16).ok());
             let overlay = match field("kind") {
                 Some("text") => {
-                    let size = field("size").and_then(|s| s.parse().ok()).unwrap_or(12.0);
+                    let flag = |name: &str| field(name) == Some("1");
+                    let style = TextStyle {
+                        family: Family::from_key(field("font").unwrap_or("sans")),
+                        size: field("size").and_then(|s| s.parse().ok()).unwrap_or(12.0),
+                        bold: flag("bold"),
+                        italic: flag("italic"),
+                        color: color.unwrap_or(0x000000),
+                    };
                     let text = string_value(annot, CONTENTS).unwrap_or_default().replace("\r\n", "\n").replace('\r', "\n");
-                    Some(Overlay::text(index, x, y, text, size))
+                    Some(Overlay::text(index, x, y, text, style))
                 }
-                Some("highlight") => Some(Overlay { page: index, x, y, w, h, kind: Kind::Highlight }),
+                Some("mark") => {
+                    let style = MarkStyle { mark: Mark::from_key(field("mark").unwrap_or("")), color: color.unwrap_or(overlay::MARK_COLORS[0]) };
+                    Some(Overlay { page: index, x, y, w, h, kind: Kind::Mark(style) })
+                }
+                // Written by the first version: pure yellow highlights.
+                Some("highlight") => {
+                    Some(Overlay { page: index, x, y, w, h, kind: Kind::Mark(MarkStyle { mark: Mark::Highlight, color: 0xFFFF00 }) })
+                }
                 Some("image") => read_image(doc, page, annot).map(|img| Overlay { page: index, x, y, w, h, kind: Kind::Image(img) }),
                 _ => None,
             };

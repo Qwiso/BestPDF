@@ -5,6 +5,7 @@
 //! stamp.rs writes them into the PDF on save and reads them back on open.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use windows::Win32::Foundation::RECT;
@@ -12,25 +13,161 @@ use windows::Win32::Graphics::Gdi::*;
 
 use crate::gdi;
 
-/// Text layout as fractions of the font size. Arial on screen and Helvetica in
-/// the PDF share these metrics, so boxes match what gets saved.
-pub const ASCENT: f32 = 0.905;
+/// Line height as a fraction of the font size.
 pub const LINE: f32 = 1.15;
-/// Highlighter yellow. Saved with the Multiply blend mode; on screen, ANDing
-/// with pure yellow is exactly that multiply.
-pub const HIGHLIGHT: (u8, u8, u8) = (255, 255, 0);
-pub const TEXT_FACE: &str = "Arial";
 /// Smallest box side, in points, a resize can produce.
 pub const MIN_SIDE: f32 = 4.0;
 
-#[derive(Clone)]
-pub enum Kind {
-    Text { text: String, size: f32 },
+/// Text colors offered in the options strip (0xRRGGBB).
+pub const TEXT_COLORS: [u32; 5] = [0x000000, 0x1F4FD1, 0xD32F2F, 0x2E7D32, 0x757575];
+/// Marker colors: yellow, green, blue, pink, orange, red.
+pub const MARK_COLORS: [u32; 6] = [0xFFEB3B, 0x8BE78B, 0x80D4FF, 0xFF9ECF, 0xFFB74D, 0xE53935];
+/// Font sizes the − / + buttons step through, in points.
+pub const TEXT_SIZES: [f32; 17] = [6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0, 48.0, 64.0, 72.0];
+
+/// Font families. Each is one of the PDF standard fonts (nothing to embed)
+/// with a metric-compatible Windows font for the screen.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Family {
+    Sans,
+    Serif,
+    Mono,
+}
+
+impl Family {
+    pub const ALL: [Family; 3] = [Family::Sans, Family::Serif, Family::Mono];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Family::Sans => "Sans",
+            Family::Serif => "Serif",
+            Family::Mono => "Mono",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Family::Sans => "sans",
+            Family::Serif => "serif",
+            Family::Mono => "mono",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Family {
+        Family::ALL.into_iter().find(|f| f.key() == key).unwrap_or(Family::Sans)
+    }
+
+    fn screen_face(self) -> &'static str {
+        match self {
+            Family::Sans => "Arial",
+            Family::Serif => "Times New Roman",
+            Family::Mono => "Courier New",
+        }
+    }
+
+    /// The standard-14 PDF font name.
+    pub fn pdf_name(self, bold: bool, italic: bool) -> &'static std::ffi::CStr {
+        match (self, bold, italic) {
+            (Family::Sans, false, false) => c"Helvetica",
+            (Family::Sans, true, false) => c"Helvetica-Bold",
+            (Family::Sans, false, true) => c"Helvetica-Oblique",
+            (Family::Sans, true, true) => c"Helvetica-BoldOblique",
+            (Family::Serif, false, false) => c"Times-Roman",
+            (Family::Serif, true, false) => c"Times-Bold",
+            (Family::Serif, false, true) => c"Times-Italic",
+            (Family::Serif, true, true) => c"Times-BoldItalic",
+            (Family::Mono, false, false) => c"Courier",
+            (Family::Mono, true, false) => c"Courier-Bold",
+            (Family::Mono, false, true) => c"Courier-Oblique",
+            (Family::Mono, true, true) => c"Courier-BoldOblique",
+        }
+    }
+
+    /// The Windows font file to embed when text needs characters the
+    /// standard fonts lack.
+    pub fn ttf(self, bold: bool, italic: bool) -> &'static str {
+        let names = match self {
+            Family::Sans => ["arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf"],
+            Family::Serif => ["times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"],
+            Family::Mono => ["cour.ttf", "courbd.ttf", "couri.ttf", "courbi.ttf"],
+        };
+        names[bold as usize + 2 * italic as usize]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct TextStyle {
+    pub family: Family,
+    pub size: f32,
+    pub bold: bool,
+    pub italic: bool,
+    /// 0xRRGGBB
+    pub color: u32,
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self { family: Family::Sans, size: 14.0, bold: false, italic: false, color: 0x000000 }
+    }
+}
+
+/// How a marked area is drawn.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Mark {
+    /// Filled, multiplied over the page like a highlighter pen.
     Highlight,
-    Image(Rc<Image>),
+    Underline,
+    Strike,
+}
+
+impl Mark {
+    pub const ALL: [Mark; 3] = [Mark::Highlight, Mark::Underline, Mark::Strike];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Mark::Highlight => "highlight",
+            Mark::Underline => "underline",
+            Mark::Strike => "strike",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Mark {
+        Mark::ALL.into_iter().find(|m| m.key() == key).unwrap_or(Mark::Highlight)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct MarkStyle {
+    pub mark: Mark,
+    /// 0xRRGGBB
+    pub color: u32,
+}
+
+impl Default for MarkStyle {
+    fn default() -> Self {
+        Self { mark: Mark::Highlight, color: MARK_COLORS[0] }
+    }
 }
 
 #[derive(Clone)]
+pub enum Kind {
+    Text { text: String, style: TextStyle },
+    Mark(MarkStyle),
+    Image(Rc<Image>),
+}
+
+impl PartialEq for Kind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Kind::Text { text: a, style: s }, Kind::Text { text: b, style: t }) => a == b && s == t,
+            (Kind::Mark(a), Kind::Mark(b)) => a == b,
+            (Kind::Image(a), Kind::Image(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct Overlay {
     pub page: usize,
     pub x: f32,
@@ -41,22 +178,22 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    pub fn text(page: usize, x: f32, y: f32, text: String, size: f32) -> Self {
-        let mut o = Self { page, x, y, w: 0.0, h: 0.0, kind: Kind::Text { text, size } };
+    pub fn text(page: usize, x: f32, y: f32, text: String, style: TextStyle) -> Self {
+        let mut o = Self { page, x, y, w: 0.0, h: 0.0, kind: Kind::Text { text, style } };
         o.fit_text();
         o
     }
 
     /// Recomputes a text box's size from its text.
     pub fn fit_text(&mut self) {
-        if let Kind::Text { text, size } = &self.kind {
-            (self.w, self.h) = text_size(text, *size);
+        if let Kind::Text { text, style } = &self.kind {
+            (self.w, self.h) = text_size(text, style);
         }
     }
 
-    /// Text and signatures scale as a whole; highlights stretch freely.
+    /// Text and signatures scale as a whole; marks stretch freely.
     pub fn keeps_aspect(&self) -> bool {
-        !matches!(self.kind, Kind::Highlight)
+        !matches!(self.kind, Kind::Mark(_))
     }
 
     pub fn text_mut(&mut self) -> Option<&mut String> {
@@ -66,29 +203,41 @@ impl Overlay {
         }
     }
 
+    /// For underline and strikethrough: the line's top and thickness within
+    /// the box, in points.
+    pub fn mark_bar(&self) -> Option<(f32, f32)> {
+        let Kind::Mark(style) = &self.kind else { return None };
+        let t = (self.h * 0.08).clamp(0.75, 3.0).min(self.h);
+        match style.mark {
+            Mark::Highlight => None,
+            Mark::Underline => Some((self.h - t, t)),
+            Mark::Strike => Some(((self.h - t) / 2.0, t)),
+        }
+    }
+
     /// Draws the overlay for a page whose top-left is at (ox, oy) on `dc`,
     /// at `s` pixels per point. `alpha` fades images (stamp preview).
     pub fn paint(&self, dc: HDC, ox: f32, oy: f32, s: f32, alpha: u8) {
         let r = self.screen_rect(ox, oy, s);
         match &self.kind {
-            Kind::Highlight => unsafe {
-                let old = SelectObject(dc, GetStockObject(DC_BRUSH));
-                let (cr, cg, cb) = HIGHLIGHT;
-                SetDCBrushColor(dc, crate::theme::rgb((cr as u32) << 16 | (cg as u32) << 8 | cb as u32));
-                // DPa: destination AND pattern.
-                let _ = PatBlt(dc, r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1), ROP_CODE(0x00A0_00C9));
-                SelectObject(dc, old);
+            Kind::Mark(style) => match self.mark_bar() {
+                None => gdi::multiply(dc, &r, style.color),
+                Some((top, t)) => {
+                    let y = (oy + (self.y + top) * s).round() as i32;
+                    let h = ((t * s).round() as i32).max(1);
+                    gdi::fill(dc, &RECT { top: y, bottom: y + h, ..r }, crate::theme::rgb(style.color));
+                }
             },
-            Kind::Text { text, size } => {
-                let px = (size * s).round() as i32;
+            Kind::Text { text, style } => {
+                let px = (style.size * s).round() as i32;
                 if px < 1 {
                     return;
                 }
-                let font = gdi::font_px(TEXT_FACE, px, 400);
+                let font = gdi::font_styled(style.family.screen_face(), px, if style.bold { 700 } else { 400 }, style.italic);
                 for (i, line) in text.split('\n').enumerate() {
-                    let top = r.top + (i as f32 * LINE * size * s).round() as i32;
+                    let top = r.top + (i as f32 * LINE * style.size * s).round() as i32;
                     let line_rect = RECT { left: r.left, top, right: r.left + 100_000, bottom: top + px * 2 };
-                    gdi::text(dc, font, crate::theme::rgb(0x000000), line, line_rect, DT_LEFT | DT_TOP | DT_NOCLIP);
+                    gdi::text(dc, font, crate::theme::rgb(style.color), line, line_rect, DT_LEFT | DT_TOP | DT_NOCLIP);
                 }
                 gdi::delete_font(font);
             }
@@ -105,32 +254,62 @@ impl Overlay {
 
 // ---- text measurement ------------------------------------------------------
 
-thread_local! {
-    /// A DC with Arial at a large em size, so widths keep sub-point precision.
-    static MEASURE: (HDC, HFONT) = unsafe {
-        let dc = CreateCompatibleDC(None);
-        let font = gdi::font_px(TEXT_FACE, MEASURE_EM as i32, 400);
-        SelectObject(dc, font.into());
-        (dc, font)
-    };
-}
 const MEASURE_EM: f32 = 1000.0;
 
-/// Width in points of one line of text at `size` points.
-pub fn text_width(line: &str, size: f32) -> f32 {
+/// A measuring font at a large em size (so widths keep sub-point precision)
+/// and its ascent as a fraction of the em.
+struct Measure {
+    font: HFONT,
+    ascent: f32,
+}
+
+thread_local! {
+    static MEASURE_DC: HDC = unsafe { CreateCompatibleDC(None) };
+    static MEASURE: RefCell<HashMap<(Family, bool, bool), Measure>> = RefCell::new(HashMap::new());
+}
+
+fn with_measure<R>(style: &TextStyle, f: impl FnOnce(HDC, &Measure) -> R) -> R {
+    MEASURE_DC.with(|&dc| {
+        MEASURE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let m = cache.entry((style.family, style.bold, style.italic)).or_insert_with(|| {
+                let weight = if style.bold { 700 } else { 400 };
+                let font = gdi::font_styled(style.family.screen_face(), MEASURE_EM as i32, weight, style.italic);
+                let mut tm = TEXTMETRICW::default();
+                unsafe {
+                    let old = SelectObject(dc, font.into());
+                    let _ = GetTextMetricsW(dc, &mut tm);
+                    SelectObject(dc, old);
+                }
+                Measure { font, ascent: tm.tmAscent as f32 / MEASURE_EM }
+            });
+            f(dc, m)
+        })
+    })
+}
+
+/// Baseline of the first line below the box top, as a fraction of the size.
+/// The PDF places text with this so it lands where GDI drew it.
+pub fn ascent(style: &TextStyle) -> f32 {
+    with_measure(style, |_, m| m.ascent)
+}
+
+/// Width in points of one line of text.
+pub fn text_width(line: &str, style: &TextStyle) -> f32 {
     if line.is_empty() {
         return 0.0;
     }
-    MEASURE.with(|&(dc, font)| gdi::text_width(dc, font, line) as f32 * size / MEASURE_EM)
+    with_measure(style, |dc, m| gdi::text_width(dc, m.font, line) as f32 * style.size / MEASURE_EM)
 }
 
 /// Box (w, h) in points for multi-line text. Empty text keeps a sliver of
 /// width so the box stays visible while typing.
-pub fn text_size(text: &str, size: f32) -> (f32, f32) {
+pub fn text_size(text: &str, style: &TextStyle) -> (f32, f32) {
     let lines = text.split('\n');
-    let w = lines.clone().map(|l| text_width(l, size)).fold(size * 0.4, f32::max);
-    (w, lines.count() as f32 * LINE * size)
+    let w = lines.clone().map(|l| text_width(l, style)).fold(style.size * 0.4, f32::max);
+    (w, lines.count() as f32 * LINE * style.size)
 }
+
 
 // ---- images ----------------------------------------------------------------
 

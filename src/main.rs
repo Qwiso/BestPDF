@@ -58,14 +58,25 @@ const ID_SAVE_FLATTEN: u16 = 112;
 const ID_ZOOM_IN: u16 = 113;
 const ID_ZOOM_OUT: u16 = 114;
 const ID_ZOOM_RESET: u16 = 115;
+const ID_UNDO: u16 = 116;
+const ID_REDO: u16 = 117;
+const ID_FIND: u16 = 118;
+const ID_FIND_NEXT: u16 = 119;
+const ID_FIND_PREV: u16 = 120;
+const ID_ROTATE_CW: u16 = 121;
+const ID_ROTATE_CCW: u16 = 122;
+const ID_DELETE_PAGE: u16 = 123;
 /// Timer that drives page drags (spring-loaded tabs, auto-scroll).
 const DRAG_TIMER: usize = 1;
 /// Commands that need a document in the active tab; greyed out otherwise.
-const DOC_COMMANDS: [u16; 3] = [ID_SAVE, ID_SAVE_AS, ID_PRINT];
+const DOC_COMMANDS: [u16; 9] =
+    [ID_SAVE, ID_SAVE_AS, ID_PRINT, ID_FIND, ID_FIND_NEXT, ID_FIND_PREV, ID_ROTATE_CW, ID_ROTATE_CCW, ID_DELETE_PAGE];
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static FILE_MENU: Cell<HMENU> = Cell::new(HMENU::default());
+    static EDIT_MENU: Cell<HMENU> = Cell::new(HMENU::default());
+    static PAGE_MENU: Cell<HMENU> = Cell::new(HMENU::default());
     static TRACKING_LEAVE: Cell<bool> = const { Cell::new(false) };
     static LAST_TITLE: RefCell<String> = const { RefCell::new(String::new()) };
 }
@@ -118,6 +129,8 @@ fn main() -> windows::core::Result<()> {
         )?;
         style_caption(hwnd);
         FILE_MENU.set(create_file_menu()?);
+        EDIT_MENU.set(create_edit_menu()?);
+        PAGE_MENU.set(create_page_menu()?);
         let accelerators = create_accelerators()?;
 
         APP.with(|a| *a.borrow_mut() = Some(App::new(GetDpiForWindow(hwnd))));
@@ -223,6 +236,38 @@ fn create_file_menu() -> windows::core::Result<HMENU> {
     }
 }
 
+fn create_edit_menu() -> windows::core::Result<HMENU> {
+    unsafe {
+        let edit = CreatePopupMenu()?;
+        AppendMenuW(edit, MF_STRING, ID_UNDO as usize, w!("&Undo\tCtrl+Z"))?;
+        AppendMenuW(edit, MF_STRING, ID_REDO as usize, w!("&Redo\tCtrl+Y"))?;
+        AppendMenuW(edit, MF_SEPARATOR, 0, None)?;
+        AppendMenuW(edit, MF_STRING, ID_FIND as usize, w!("&Find…\tCtrl+F"))?;
+        AppendMenuW(edit, MF_STRING, ID_FIND_NEXT as usize, w!("Find &Next\tF3"))?;
+        AppendMenuW(edit, MF_STRING, ID_FIND_PREV as usize, w!("Find &Previous\tShift+F3"))?;
+        AppendMenuW(edit, MF_SEPARATOR, 0, None)?;
+        AppendMenuW(edit, MF_STRING, ID_ROTATE_CW as usize, w!("Rotate Page &Clockwise\tCtrl+R"))?;
+        AppendMenuW(edit, MF_STRING, ID_ROTATE_CCW as usize, w!("Rotate Page Counterc&lockwise\tCtrl+Shift+R"))?;
+        AppendMenuW(edit, MF_STRING, ID_DELETE_PAGE as usize, w!("&Delete Page"))?;
+        Ok(edit)
+    }
+}
+
+/// Right-click on a page.
+fn create_page_menu() -> windows::core::Result<HMENU> {
+    unsafe {
+        let page = CreatePopupMenu()?;
+        AppendMenuW(page, MF_STRING, ID_ROTATE_CW as usize, w!("Rotate &Clockwise\tCtrl+R"))?;
+        AppendMenuW(page, MF_STRING, ID_ROTATE_CCW as usize, w!("Rotate Counterc&lockwise\tCtrl+Shift+R"))?;
+        AppendMenuW(page, MF_SEPARATOR, 0, None)?;
+        AppendMenuW(page, MF_STRING, ID_DELETE_PAGE as usize, w!("&Delete Page"))?;
+        AppendMenuW(page, MF_SEPARATOR, 0, None)?;
+        AppendMenuW(page, MF_STRING, ID_UNDO as usize, w!("&Undo\tCtrl+Z"))?;
+        AppendMenuW(page, MF_STRING, ID_REDO as usize, w!("&Redo\tCtrl+Y"))?;
+        Ok(page)
+    }
+}
+
 fn create_accelerators() -> windows::core::Result<HACCEL> {
     let key = |k: u16, shift: bool, cmd: u16| ACCEL {
         fVirt: FVIRTKEY | FCONTROL | if shift { FSHIFT } else { ACCEL_VIRT_FLAGS(0) },
@@ -250,6 +295,14 @@ fn create_accelerators() -> windows::core::Result<HACCEL> {
             key(VK_SUBTRACT.0, false, ID_ZOOM_OUT),
             key(b'0' as u16, false, ID_ZOOM_RESET),
             key(VK_NUMPAD0.0, false, ID_ZOOM_RESET),
+            key(b'Z' as u16, false, ID_UNDO),
+            key(b'Y' as u16, false, ID_REDO),
+            key(b'Z' as u16, true, ID_REDO),
+            key(b'F' as u16, false, ID_FIND),
+            key(b'R' as u16, false, ID_ROTATE_CW),
+            key(b'R' as u16, true, ID_ROTATE_CCW),
+            ACCEL { fVirt: FVIRTKEY, key: VK_F3.0, cmd: ID_FIND_NEXT },
+            ACCEL { fVirt: FVIRTKEY | FSHIFT, key: VK_F3.0, cmd: ID_FIND_PREV },
         ])
     }
 }
@@ -305,6 +358,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_LBUTTONDBLCLK => {
             let (x, y) = lparam_point(lparam);
             perform(hwnd, with_app(|a| a.double_click(x, y)));
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = lparam_point(lparam);
+            if let Some(Some(page)) = with_app(|a| a.page_at_point(x, y)) {
+                show_page_menu(hwnd, page, x, y);
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -373,6 +433,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
+        WM_SYSCHAR if matches!(wparam.0 as u8, b'e' | b'E') => {
+            if let Some((x, y)) = with_app(|a| a.edit_menu_point()) {
+                show_menu(hwnd, EDIT_MENU.get(), x, y);
+            }
+            LRESULT(0)
+        }
         WM_SYSCHAR if matches!(wparam.0 as u8, b'f' | b'F') => {
             if let Some((x, y)) = with_app(|a| a.file_menu_point()) {
                 show_file_menu(hwnd, x, y);
@@ -397,6 +463,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 OverlaySave::Flatten => ID_SAVE_FLATTEN,
             };
             let _ = CheckMenuRadioItem(menu, ID_SAVE_ASK as u32, ID_SAVE_FLATTEN as u32, checked as u32, MF_BYCOMMAND.0);
+            let (undo, redo) = with_app(|a| a.undo_state()).unwrap_or_default();
+            let _ = EnableMenuItem(menu, ID_UNDO as u32, state(undo));
+            let _ = EnableMenuItem(menu, ID_REDO as u32, state(redo));
             LRESULT(0)
         }
         WM_DROPFILES => {
@@ -459,6 +528,7 @@ fn perform(hwnd: HWND, action: Option<Action>) {
                 return;
             }
             Some(Action::FileMenu(x, y)) => return show_file_menu(hwnd, x, y),
+            Some(Action::EditMenu(x, y)) => return show_menu(hwnd, EDIT_MENU.get(), x, y),
             Some(Action::ImportSignature) => {
                 if let Some(path) = dialog::pick_image(hwnd) {
                     let picture = signature::load_image(&path).and_then(|img| {
@@ -530,12 +600,35 @@ fn refresh(hwnd: HWND) {
 }
 
 fn show_file_menu(hwnd: HWND, x: i32, y: i32) {
+    show_menu(hwnd, FILE_MENU.get(), x, y);
+}
+
+fn show_menu(hwnd: HWND, menu: HMENU, x: i32, y: i32) {
     let mut pt = POINT { x, y };
     unsafe {
         let _ = ClientToScreen(hwnd, &mut pt);
         // Modal: runs its own loop and sends WM_COMMAND on selection.
-        let _ = TrackPopupMenu(FILE_MENU.get(), TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, None, hwnd, None);
+        let _ = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, None, hwnd, None);
     }
+    perform(hwnd, with_app(|a| a.mouse_leave()));
+}
+
+/// The right-click menu for page `page`; its commands act on that page.
+fn show_page_menu(hwnd: HWND, page: usize, x: i32, y: i32) {
+    let mut pt = POINT { x, y };
+    let id = unsafe {
+        let _ = ClientToScreen(hwnd, &mut pt);
+        let flags = TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY;
+        TrackPopupMenu(PAGE_MENU.get(), flags, pt.x, pt.y, None, hwnd, None).0 as u16
+    };
+    let action = match id {
+        ID_ROTATE_CW => with_app(|a| a.rotate_page(Some(page), 1)),
+        ID_ROTATE_CCW => with_app(|a| a.rotate_page(Some(page), -1)),
+        ID_DELETE_PAGE => with_app(|a| a.delete_page(Some(page))),
+        ID_UNDO | ID_REDO => with_app(|a| a.undo(id == ID_REDO)),
+        _ => None,
+    };
+    perform(hwnd, action);
     perform(hwnd, with_app(|a| a.mouse_leave()));
 }
 
@@ -579,6 +672,13 @@ fn on_command(hwnd: HWND, id: u16) {
                 error_box(hwnd, &e);
             }
         }
+        ID_UNDO | ID_REDO => perform(hwnd, with_app(|a| a.undo(id == ID_REDO))),
+        ID_FIND => perform(hwnd, with_app(|a| a.open_find())),
+        ID_FIND_NEXT => perform(hwnd, with_app(|a| a.find_step(1))),
+        ID_FIND_PREV => perform(hwnd, with_app(|a| a.find_step(-1))),
+        ID_ROTATE_CW => perform(hwnd, with_app(|a| a.rotate_page(None, 1))),
+        ID_ROTATE_CCW => perform(hwnd, with_app(|a| a.rotate_page(None, -1))),
+        ID_DELETE_PAGE => perform(hwnd, with_app(|a| a.delete_page(None))),
         ID_ZOOM_IN => perform(hwnd, with_app(|a| a.zoom_step(1))),
         ID_ZOOM_OUT => perform(hwnd, with_app(|a| a.zoom_step(-1))),
         ID_ZOOM_RESET => perform(hwnd, with_app(|a| a.zoom_reset())),

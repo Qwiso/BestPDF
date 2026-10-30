@@ -204,11 +204,67 @@ impl Document {
         Ok(())
     }
 
-    /// Inserts a copy of this document's own page `index` at position `at`.
-    /// Goes through a scratch document: PDFium imports between two documents.
-    pub fn duplicate_page(&mut self, index: usize, at: usize) -> Result<(), String> {
-        let scratch = Self::from_page(self, index)?;
-        self.import_page(&scratch, 0, at)
+    /// Turns page `index` by `quarters` quarter turns clockwise (negative:
+    /// counterclockwise).
+    pub fn rotate_page(&mut self, index: usize, quarters: i32) -> Result<(), String> {
+        let a = api();
+        unsafe {
+            let page = (a.FPDF_LoadPage)(self.handle, index as c_int);
+            if page.is_null() {
+                return Err(format!("Could not rotate page {}", index + 1));
+            }
+            let now = (a.FPDFPage_GetRotation)(page);
+            (a.FPDFPage_SetRotation)(page, (now + quarters).rem_euclid(4));
+            (a.FPDF_ClosePage)(page);
+        }
+        self.refresh();
+        Ok(())
+    }
+
+    /// Every occurrence of `query` in the page text: per match, its page and
+    /// the boxes (x, y, w, h in display points) it covers, in reading order.
+    pub fn find(&self, query: &str, match_case: bool) -> Vec<(usize, Vec<[f32; 4]>)> {
+        let a = api();
+        let mut found = Vec::new();
+        if query.is_empty() {
+            return found;
+        }
+        let what: Vec<u16> = query.encode_utf16().chain([0]).collect();
+        let flags = if match_case { pdfium::FPDF_MATCHCASE } else { 0 };
+        for (i, &size) in self.page_sizes.iter().enumerate() {
+            unsafe {
+                let page = (a.FPDF_LoadPage)(self.handle, i as c_int);
+                if page.is_null() {
+                    continue;
+                }
+                let text = (a.FPDFText_LoadPage)(page);
+                if !text.is_null() {
+                    let map = stamp::PageMap::new(page, size);
+                    let search = (a.FPDFText_FindStart)(text, what.as_ptr(), flags, 0);
+                    while !search.is_null() && (a.FPDFText_FindNext)(search) != 0 {
+                        let (start, count) = ((a.FPDFText_GetSchResultIndex)(search), (a.FPDFText_GetSchCount)(search));
+                        let boxes = (0..(a.FPDFText_CountRects)(text, start, count))
+                            .filter_map(|r| {
+                                let (mut l, mut t, mut rt, mut b) = (0.0, 0.0, 0.0, 0.0);
+                                if (a.FPDFText_GetRect)(text, r, &mut l, &mut t, &mut rt, &mut b) == 0 {
+                                    return None;
+                                }
+                                let (x0, y0) = map.to_display(l, t);
+                                let (x1, y1) = map.to_display(rt, b);
+                                Some([x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs()])
+                            })
+                            .collect();
+                        found.push((i, boxes));
+                    }
+                    if !search.is_null() {
+                        (a.FPDFText_FindClose)(search);
+                    }
+                    (a.FPDFText_ClosePage)(text);
+                }
+                (a.FPDF_ClosePage)(page);
+            }
+        }
+        found
     }
 
     pub fn delete_page(&mut self, index: usize) {

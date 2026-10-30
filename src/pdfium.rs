@@ -16,6 +16,8 @@ pub type FPDF_BITMAP = *mut c_void;
 pub type FPDF_ANNOTATION = *mut c_void;
 pub type FPDF_PAGEOBJECT = *mut c_void;
 pub type FPDF_FONT = *mut c_void;
+pub type FPDF_TEXTPAGE = *mut c_void;
+pub type FPDF_SCHHANDLE = *mut c_void;
 pub type FPDF_BOOL = c_int;
 /// NUL-terminated UTF-16.
 pub type FPDF_WIDESTRING = *const u16;
@@ -29,6 +31,7 @@ pub const FPDF_ANNOT_FLAG_PRINT: c_int = 1 << 2;
 pub const FPDF_PAGEOBJ_IMAGE: c_int = 3;
 pub const FPDF_FONT_TRUETYPE: c_int = 2;
 pub const FPDF_FILLMODE_ALTERNATE: c_int = 1;
+pub const FPDF_MATCHCASE: c_ulong = 1;
 /// FPDF_SaveAsCopy: write a complete new file (required after page edits).
 pub const FPDF_NO_INCREMENTAL: u32 = 2;
 
@@ -133,6 +136,19 @@ pub struct Api {
     pub FPDFImageObj_SetMatrix: unsafe extern "system" fn(FPDF_PAGEOBJECT, f64, f64, f64, f64, f64, f64) -> FPDF_BOOL,
     pub FPDFImageObj_GetImagePixelSize: unsafe extern "system" fn(FPDF_PAGEOBJECT, *mut c_uint, *mut c_uint) -> FPDF_BOOL,
     pub FPDFImageObj_GetRenderedBitmap: unsafe extern "system" fn(FPDF_DOCUMENT, FPDF_PAGE, FPDF_PAGEOBJECT) -> FPDF_BITMAP,
+    // rotation
+    pub FPDFPage_GetRotation: unsafe extern "system" fn(FPDF_PAGE) -> c_int,
+    pub FPDFPage_SetRotation: unsafe extern "system" fn(FPDF_PAGE, c_int),
+    // text search
+    pub FPDFText_LoadPage: unsafe extern "system" fn(FPDF_PAGE) -> FPDF_TEXTPAGE,
+    pub FPDFText_ClosePage: unsafe extern "system" fn(FPDF_TEXTPAGE),
+    pub FPDFText_FindStart: unsafe extern "system" fn(FPDF_TEXTPAGE, FPDF_WIDESTRING, c_ulong, c_int) -> FPDF_SCHHANDLE,
+    pub FPDFText_FindNext: unsafe extern "system" fn(FPDF_SCHHANDLE) -> FPDF_BOOL,
+    pub FPDFText_GetSchResultIndex: unsafe extern "system" fn(FPDF_SCHHANDLE) -> c_int,
+    pub FPDFText_GetSchCount: unsafe extern "system" fn(FPDF_SCHHANDLE) -> c_int,
+    pub FPDFText_FindClose: unsafe extern "system" fn(FPDF_SCHHANDLE),
+    pub FPDFText_CountRects: unsafe extern "system" fn(FPDF_TEXTPAGE, c_int, c_int) -> c_int,
+    pub FPDFText_GetRect: unsafe extern "system" fn(FPDF_TEXTPAGE, c_int, *mut f64, *mut f64, *mut f64, *mut f64) -> FPDF_BOOL,
 }
 
 static API: OnceLock<Api> = OnceLock::new();
@@ -209,6 +225,17 @@ pub fn load(dir: &Path) -> Result<(), String> {
         FPDFImageObj_SetMatrix: sym!("FPDFImageObj_SetMatrix"),
         FPDFImageObj_GetImagePixelSize: sym!("FPDFImageObj_GetImagePixelSize"),
         FPDFImageObj_GetRenderedBitmap: sym!("FPDFImageObj_GetRenderedBitmap"),
+        FPDFPage_GetRotation: sym!("FPDFPage_GetRotation"),
+        FPDFPage_SetRotation: sym!("FPDFPage_SetRotation"),
+        FPDFText_LoadPage: sym!("FPDFText_LoadPage"),
+        FPDFText_ClosePage: sym!("FPDFText_ClosePage"),
+        FPDFText_FindStart: sym!("FPDFText_FindStart"),
+        FPDFText_FindNext: sym!("FPDFText_FindNext"),
+        FPDFText_GetSchResultIndex: sym!("FPDFText_GetSchResultIndex"),
+        FPDFText_GetSchCount: sym!("FPDFText_GetSchCount"),
+        FPDFText_FindClose: sym!("FPDFText_FindClose"),
+        FPDFText_CountRects: sym!("FPDFText_CountRects"),
+        FPDFText_GetRect: sym!("FPDFText_GetRect"),
     };
     unsafe { (api.FPDF_InitLibrary)() };
     let _ = API.set(api);

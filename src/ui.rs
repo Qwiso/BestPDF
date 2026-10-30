@@ -15,10 +15,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 use crate::document::Document;
 use crate::gdi::{self, rect, BackBuffer, Tint};
-use crate::overlay::{self, Image, Kind, Overlay};
+use crate::overlay::{self, Family, Image, Kind, Mark, MarkStyle, Overlay, TextStyle};
 use crate::signature::{Library, SigKind};
 use crate::signpad::{PadEvent, SignPad};
-use crate::tab::{Tab, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN};
+use crate::tab::{PageOp, Tab, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN};
 use crate::theme::{self as t, Metrics};
 
 pub enum Action {
@@ -30,6 +30,8 @@ pub enum Action {
     Release(Option<String>),
     /// Show the File menu at this client point.
     FileMenu(i32, i32),
+    /// Show the Edit menu at this client point.
+    EditMenu(i32, i32),
     /// Close this tab, asking first if it has unsaved changes.
     CloseTab(usize),
     /// Pick a picture for the signature being made.
@@ -54,8 +56,6 @@ pub enum Cursor {
 
 /// How long the pointer must rest on a tab during a page drag to switch to it.
 const SPRING_LOAD: Duration = Duration::from_millis(450);
-/// Font size of new text boxes, in points.
-const TEXT_SIZE: f32 = 14.0;
 
 /// Tool buttons in the menu strip.
 #[derive(Clone, Copy, PartialEq)]
@@ -68,6 +68,49 @@ enum ToolButton {
 
 const TOOL_BUTTONS: [(ToolButton, &str); 4] =
     [(ToolButton::Select, "Select"), (ToolButton::Text, "Text"), (ToolButton::Highlight, "Highlight"), (ToolButton::Sign, "Sign ▾")];
+
+/// Controls in the options strip (right of the tool buttons) for the text
+/// or mark style.
+#[derive(Clone, Copy, PartialEq)]
+enum Opt {
+    Family(Family),
+    SizeDown,
+    SizeUp,
+    Bold,
+    Italic,
+    TextColor(usize),
+    Mark(Mark),
+    MarkColor(usize),
+}
+
+/// Which style the options strip shows.
+enum Options {
+    Text(TextStyle),
+    Mark(MarkStyle),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FindHit {
+    Bar,
+    Input,
+    Case,
+    Prev,
+    Next,
+    Close,
+}
+
+/// The find bar and its results.
+struct Find {
+    query: String,
+    match_case: bool,
+    /// Typing goes into the find box.
+    focused: bool,
+    /// Per match: page and boxes in display points.
+    results: Vec<(usize, Vec<[f32; 4]>)>,
+    current: Option<usize>,
+    /// (tab index, page generation) the results were found in.
+    found_in: Option<(usize, u64)>,
+}
 
 /// What a click on empty page space does. Overlays can be moved and resized
 /// with any tool.
@@ -158,6 +201,9 @@ fn resize_box([x, y, w, h]: [f32; 4], gx: i8, gy: i8, dx: f32, dy: f32, aspect: 
 enum Hit {
     None,
     MenuFile,
+    MenuEdit,
+    Opt(Opt),
+    Find(FindHit),
     Tab(usize),
     TabClose(usize),
     TabStrip,
@@ -234,6 +280,7 @@ enum DropTarget {
 struct Regions {
     menu: RECT,
     file_button: RECT,
+    edit_button: RECT,
     tabs: RECT,
     editor: RECT,
     minimap: RECT,
@@ -301,17 +348,6 @@ fn check_can_take(src: &Tab, d: PageDrag) -> Result<(), String> {
     Ok(())
 }
 
-/// Deletes page `page` of `tab` with its overlays.
-fn take_page(tab: &mut Tab, page: usize) {
-    tab.doc.delete_page(page);
-    tab.remap_overlays(|p| match p {
-        _ if p == page => None,
-        _ if p > page => Some(p - 1),
-        _ => Some(p),
-    });
-    tab.pages_changed();
-}
-
 /// Minimap geometry for the active tab. `f` maps content px → minimap px.
 struct MiniGeo {
     f: f32,
@@ -342,6 +378,11 @@ pub struct App {
     mouse: (i32, i32),
     /// First half of a UTF-16 surrogate pair typed into a text box.
     surrogate: Option<u16>,
+    /// Styles for new text boxes and marks (the options strip edits these,
+    /// and the selected overlay's).
+    text_style: TextStyle,
+    mark_style: MarkStyle,
+    find: Option<Find>,
     /// While the user drags the window edge, cached pages are stretched instead
     /// of re-rendered every frame; a crisp render happens when the drag ends.
     pub live_resize: bool,
@@ -368,6 +409,9 @@ impl App {
             library: None,
             mouse: (-1, -1),
             surrogate: None,
+            text_style: TextStyle::default(),
+            mark_style: MarkStyle::default(),
+            find: None,
             live_resize: false,
         }
     }
@@ -504,6 +548,17 @@ impl App {
         (b.left, b.bottom)
     }
 
+    /// Client point where the Edit menu drops down (for Alt+E).
+    pub fn edit_menu_point(&self) -> (i32, i32) {
+        let b = self.regions().edit_button;
+        (b.left, b.bottom)
+    }
+
+    /// (can undo, can redo) in the active tab, for greying out menu items.
+    pub fn undo_state(&self) -> (bool, bool) {
+        self.active_tab().map_or((false, false), |t| (t.can_undo(), t.can_redo()))
+    }
+
     pub fn title(&self) -> String {
         match self.tabs.get(self.active) {
             Some(Slot::Doc(tab)) if tab.dirty => format!("● {} — Best PDF", tab.name()),
@@ -520,6 +575,8 @@ impl App {
         let menu = rect(0, 0, w, m.px(t::MENU_H));
         let label_w = gdi::text_width(self.measure, self.fonts.ui, "File") + m.px(16);
         let file_button = rect(m.px(6), m.px(4), label_w, menu.bottom - m.px(8));
+        let edit_w = gdi::text_width(self.measure, self.fonts.ui, "Edit") + m.px(16);
+        let edit_button = rect(file_button.right + m.px(2), file_button.top, edit_w, file_button.bottom - file_button.top);
         let tabs_h = if self.has_tabs() { m.px(t::TAB_H) } else { 0 };
         let tabs = rect(0, menu.bottom, w, tabs_h);
         let status = rect(0, h - m.px(t::STATUS_H), w, m.px(t::STATUS_H));
@@ -530,6 +587,7 @@ impl App {
         Regions {
             menu,
             file_button,
+            edit_button,
             tabs,
             editor: rect(0, body_top, (w - sb_w - mm_w).max(0), body_h),
             minimap: rect(w - sb_w - mm_w, body_top, mm_w, body_h),
@@ -618,6 +676,15 @@ impl App {
         if gdi::contains(&r.file_button, x, y) {
             return Hit::MenuFile;
         }
+        if gdi::contains(&r.edit_button, x, y) {
+            return Hit::MenuEdit;
+        }
+        if let Some(&(o, _)) = self.option_rects().iter().find(|(_, r)| gdi::contains(r, x, y)) {
+            return Hit::Opt(o);
+        }
+        if let Some(&(f, _)) = self.find_rects().iter().find(|(_, r)| gdi::contains(r, x, y)) {
+            return Hit::Find(f);
+        }
         if let Some(&(b, _)) = self.tool_rects().iter().find(|(_, r)| gdi::contains(r, x, y)) {
             return Hit::Tool(b);
         }
@@ -652,7 +719,7 @@ impl App {
 
     /// Tool buttons, right of the File menu.
     fn tool_rects(&self) -> Vec<(ToolButton, RECT)> {
-        let fb = self.regions().file_button;
+        let fb = self.regions().edit_button;
         let mut x = fb.right + self.m.px(14);
         TOOL_BUTTONS
             .iter()
@@ -887,6 +954,307 @@ impl App {
             }
         }
         Action::Redraw
+    }
+
+    // ---- style options ---------------------------------------------------------
+
+    /// The style the options strip edits: the selected overlay's, else the
+    /// current tool's defaults for new ones.
+    fn options(&self) -> Option<Options> {
+        if let Some(o) = self.active_tab().and_then(|t| t.overlays.get(t.selected?)) {
+            match &o.kind {
+                Kind::Text { style, .. } => return Some(Options::Text(*style)),
+                Kind::Mark(style) => return Some(Options::Mark(*style)),
+                Kind::Image(_) => {}
+            }
+        }
+        match self.tool {
+            Tool::Text => Some(Options::Text(self.text_style)),
+            Tool::Highlight => Some(Options::Mark(self.mark_style)),
+            _ => None,
+        }
+    }
+
+    /// Controls of the options strip, after the tool buttons.
+    fn option_rects(&self) -> Vec<(Opt, RECT)> {
+        let Some(options) = self.options() else { return Vec::new() };
+        let Some(&(_, last)) = self.tool_rects().last() else { return Vec::new() };
+        let m = self.m;
+        let (top, bottom) = (last.top, last.bottom);
+        let mut x = last.right + m.px(22);
+        let mut out = Vec::new();
+        let button = |out: &mut Vec<(Opt, RECT)>, x: &mut i32, o: Opt, w: i32| {
+            out.push((o, RECT { left: *x, top, right: *x + w, bottom }));
+            *x += w + m.px(2);
+        };
+        let label_w = |s: &str| gdi::text_width(self.measure, self.fonts.ui, s) + m.px(14);
+        let swatch = m.px(22);
+        match options {
+            Options::Text(_) => {
+                for f in Family::ALL {
+                    button(&mut out, &mut x, Opt::Family(f), label_w(f.label()));
+                }
+                x += m.px(12);
+                button(&mut out, &mut x, Opt::SizeDown, m.px(22));
+                x += m.px(30); // the size reads between − and +
+                button(&mut out, &mut x, Opt::SizeUp, m.px(22));
+                x += m.px(12);
+                button(&mut out, &mut x, Opt::Bold, m.px(26));
+                button(&mut out, &mut x, Opt::Italic, m.px(26));
+                x += m.px(12);
+                for i in 0..overlay::TEXT_COLORS.len() {
+                    button(&mut out, &mut x, Opt::TextColor(i), swatch);
+                }
+            }
+            Options::Mark(_) => {
+                for (mk, label) in [(Mark::Highlight, "Highlight"), (Mark::Underline, "Underline"), (Mark::Strike, "Strike")] {
+                    button(&mut out, &mut x, Opt::Mark(mk), label_w(label));
+                }
+                x += m.px(12);
+                for i in 0..overlay::MARK_COLORS.len() {
+                    button(&mut out, &mut x, Opt::MarkColor(i), swatch);
+                }
+            }
+        }
+        out
+    }
+
+    fn option_click(&mut self, opt: Opt) -> Action {
+        match self.options() {
+            Some(Options::Text(mut style)) => {
+                match opt {
+                    Opt::Family(f) => style.family = f,
+                    Opt::SizeDown => {
+                        style.size = overlay::TEXT_SIZES.iter().rev().copied().find(|&v| v < style.size - 0.01).unwrap_or((style.size * 0.9).max(2.0))
+                    }
+                    Opt::SizeUp => style.size = overlay::TEXT_SIZES.iter().copied().find(|&v| v > style.size + 0.01).unwrap_or(style.size * 1.1),
+                    Opt::Bold => style.bold = !style.bold,
+                    Opt::Italic => style.italic = !style.italic,
+                    Opt::TextColor(i) => style.color = overlay::TEXT_COLORS[i],
+                    _ => return Action::None,
+                }
+                self.text_style = style;
+                self.restyle(|kind| {
+                    if let Kind::Text { style: s, .. } = kind {
+                        *s = style;
+                    }
+                });
+            }
+            Some(Options::Mark(mut style)) => {
+                match opt {
+                    Opt::Mark(mk) => style.mark = mk,
+                    Opt::MarkColor(i) => style.color = overlay::MARK_COLORS[i],
+                    _ => return Action::None,
+                }
+                self.mark_style = style;
+                self.restyle(|kind| {
+                    if let Kind::Mark(s) = kind {
+                        *s = style;
+                    }
+                });
+            }
+            None => return Action::None,
+        }
+        Action::Redraw
+    }
+
+    /// Applies a style change to the selected overlay (one undo step, or part
+    /// of the typing session in progress).
+    fn restyle(&mut self, f: impl Fn(&mut Kind)) {
+        let Some(tab) = self.active_tab_mut() else { return };
+        let Some(i) = tab.selected else { return };
+        let apply = |t: &mut Tab| {
+            let o = &mut t.overlays[i];
+            f(&mut o.kind);
+            o.fit_text();
+        };
+        if tab.caret.is_some() {
+            apply(tab);
+            tab.dirty = true;
+        } else {
+            tab.change(apply);
+        }
+    }
+
+    // ---- find ----------------------------------------------------------------
+
+    pub fn open_find(&mut self) -> Action {
+        if self.active_tab().is_none() {
+            return Action::None;
+        }
+        let find = self.find.get_or_insert_with(|| Find {
+            query: String::new(),
+            match_case: false,
+            focused: true,
+            results: Vec::new(),
+            current: None,
+            found_in: None,
+        });
+        find.focused = true;
+        Action::Redraw
+    }
+
+    /// Searches the active tab again; with `reveal`, jumps to the first match
+    /// at or after the page in view.
+    fn run_find(&mut self, reveal: bool) {
+        let Some(tab) = self.active_tab() else { return };
+        let here = tab.current_page(self.view_h());
+        let found_in = Some((self.active, tab.generation));
+        let Some(find) = &self.find else { return };
+        let results = tab.doc.find(&find.query, find.match_case);
+        let current = results.iter().position(|(p, _)| *p >= here).or(if results.is_empty() { None } else { Some(0) });
+        let find = self.find.as_mut().unwrap();
+        (find.results, find.current, find.found_in) = (results, current, found_in);
+        if reveal {
+            self.reveal_match();
+        }
+    }
+
+    /// Next (`dir` > 0) or previous match.
+    pub fn find_step(&mut self, dir: i32) -> Action {
+        if self.find.is_none() {
+            return self.open_find();
+        }
+        self.refresh_find();
+        let Some(find) = self.find.as_mut() else { return Action::None };
+        let n = find.results.len();
+        if n == 0 {
+            return Action::Redraw;
+        }
+        find.current = Some(match find.current {
+            Some(c) => (c as i32 + dir).rem_euclid(n as i32) as usize,
+            None => 0,
+        });
+        self.reveal_match();
+        Action::Redraw
+    }
+
+    /// Re-searches if the results are for another tab or older pages.
+    fn refresh_find(&mut self) {
+        let Some(tab) = self.active_tab() else { return };
+        let now = Some((self.active, tab.generation));
+        if self.find.as_ref().is_some_and(|f| f.found_in != now) {
+            self.run_find(false);
+        }
+    }
+
+    /// Scrolls the current match into view, a third of the way down.
+    fn reveal_match(&mut self) {
+        self.sync_layout();
+        let Some((page, b)) = self.find.as_ref().and_then(|f| f.results.get(f.current?)).and_then(|(p, boxes)| Some((*p, *boxes.first()?)))
+        else {
+            return;
+        };
+        let e = self.regions().editor;
+        let (view_w, view_h) = (e.right - e.left, e.bottom - e.top);
+        let Some(tab) = self.active_tab_mut() else { return };
+        let Some(&p) = tab.pages().get(page) else { return };
+        let s = p.w as f32 / tab.doc.page_sizes.get(page).map_or(1.0, |z| z.0);
+        let (cx, cy) = (p.x + (b[0] * s) as i32, p.y + (b[1] * s) as i32);
+        let (cw, ch) = ((b[2] * s) as i32, (b[3] * s) as i32);
+        if cy < tab.scroll_y || cy + ch > tab.scroll_y + view_h {
+            tab.scroll_to(cy - view_h / 3, view_h);
+        }
+        if cx < tab.scroll_x || cx + cw > tab.scroll_x + view_w {
+            tab.scroll_x_to(cx - view_w / 3, view_w);
+        }
+    }
+
+    fn find_click(&mut self, f: FindHit) -> Action {
+        let Some(find) = self.find.as_mut() else { return Action::None };
+        match f {
+            FindHit::Bar | FindHit::Input => Action::Redraw,
+            FindHit::Case => {
+                find.match_case = !find.match_case;
+                self.run_find(true);
+                Action::Redraw
+            }
+            FindHit::Prev => self.find_step(-1),
+            FindHit::Next => self.find_step(1),
+            FindHit::Close => {
+                self.find = None;
+                Action::Redraw
+            }
+        }
+    }
+
+    /// The find bar, top right of the page view, and its parts.
+    fn find_rects(&self) -> Vec<(FindHit, RECT)> {
+        if self.find.is_none() || self.active_tab().is_none() {
+            return Vec::new();
+        }
+        let m = self.m;
+        let e = self.regions().editor;
+        let (w, h) = (m.px(440).min(e.right - e.left - m.px(16)), m.px(36));
+        let bar = rect(e.right - w - m.px(16), e.top + m.px(8), w, h);
+        let pad = m.px(6);
+        let b = m.px(26);
+        let (top, bh) = (bar.top + (h - b) / 2, b);
+        let close = rect(bar.right - pad - b, top, b, bh);
+        let next = rect(close.left - m.px(2) - b, top, b, bh);
+        let prev = rect(next.left - m.px(2) - b, top, b, bh);
+        let case = rect(prev.left - m.px(10) - b, top, b, bh);
+        let input = RECT { left: bar.left + pad, top, right: case.left - m.px(90), bottom: top + bh };
+        // Buttons first: they win hit-tests over the bar.
+        vec![
+            (FindHit::Close, close),
+            (FindHit::Next, next),
+            (FindHit::Prev, prev),
+            (FindHit::Case, case),
+            (FindHit::Input, input),
+            (FindHit::Bar, bar),
+        ]
+    }
+
+    // ---- page commands ---------------------------------------------------------
+
+    /// The page under a client point, in the page view or the minimap.
+    pub fn page_at_point(&self, x: i32, y: i32) -> Option<usize> {
+        match self.hit_test(x, y) {
+            Hit::Editor => self.page_point(x, y).map(|(p, _, _)| p),
+            Hit::Minimap => self.page_at(x, y),
+            _ => None,
+        }
+    }
+
+    fn command_page(&self, page: Option<usize>) -> Option<usize> {
+        page.or_else(|| self.active_tab().map(|t| t.current_page(self.view_h())))
+    }
+
+    /// Turns a page (default: the one in view) a quarter turn; `quarters` < 0
+    /// is counterclockwise.
+    pub fn rotate_page(&mut self, page: Option<usize>, quarters: i32) -> Action {
+        let Some(page) = self.command_page(page) else { return Action::None };
+        let Some(tab) = self.active_tab_mut() else { return Action::None };
+        match tab.page_edit(PageOp::Rotate { page, quarters }) {
+            Ok(()) => Action::Redraw,
+            Err(e) => Action::Error(e),
+        }
+    }
+
+    /// Deletes a page (default: the one in view). Undo brings it back.
+    pub fn delete_page(&mut self, page: Option<usize>) -> Action {
+        let Some(page) = self.command_page(page) else { return Action::None };
+        let Some(tab) = self.active_tab_mut() else { return Action::None };
+        if tab.doc.page_count() <= 1 {
+            return Action::Error(format!("{} has only one page, so it can't be deleted.", tab.name()));
+        }
+        match tab.page_edit(PageOp::Delete { at: page }) {
+            Ok(()) => Action::Redraw,
+            Err(e) => Action::Error(e),
+        }
+    }
+
+    pub fn undo(&mut self, redo: bool) -> Action {
+        if self.drag != Drag::None {
+            return Action::None;
+        }
+        let Some(tab) = self.active_tab_mut() else { return Action::None };
+        match tab.undo(redo) {
+            Ok(true) => Action::Redraw,
+            Ok(false) => Action::None,
+            Err(e) => Action::Error(e),
+        }
     }
 
     // ---- zoom --------------------------------------------------------------
@@ -1128,37 +1496,26 @@ impl App {
         if d.from == to {
             let Some(tab) = self.doc_tab_mut(to) else { return Ok(()) };
             if d.copy {
-                tab.doc.duplicate_page(d.page, at)?;
+                let page = Document::from_page(&tab.doc, d.page)?;
                 let copies = tab.overlays_on(d.page);
-                tab.remap_overlays(|p| Some(if p >= at { p + 1 } else { p }));
+                tab.page_edit(PageOp::Insert { at, page })?;
                 tab.add_overlays(copies, at);
             } else {
                 // `at` counts the page itself, so past it the final index is one less.
                 let (from, dest) = (d.page, if at > d.page { at - 1 } else { at });
-                if dest == from {
-                    return Ok(());
+                if dest != from {
+                    tab.page_edit(PageOp::Move { from, to: dest })?;
                 }
-                tab.doc.move_page(from, dest)?;
-                tab.remap_overlays(|p| {
-                    Some(match p {
-                        _ if p == from => dest,
-                        _ if from < dest && p > from && p <= dest => p - 1,
-                        _ if dest < from && p >= dest && p < from => p + 1,
-                        _ => p,
-                    })
-                });
             }
-            tab.pages_changed();
             return Ok(());
         }
         let Some((src, dst)) = self.two_doc_tabs(d.from, to) else { return Ok(()) };
         check_can_take(src, d)?;
-        dst.doc.import_page(&src.doc, d.page, at)?;
-        dst.remap_overlays(|p| Some(if p >= at { p + 1 } else { p }));
+        let page = Document::from_page(&src.doc, d.page)?;
+        dst.page_edit(PageOp::Insert { at, page })?;
         dst.add_overlays(src.overlays_on(d.page), at);
-        dst.pages_changed();
         if !d.copy {
-            take_page(src, d.page);
+            src.page_edit(PageOp::Delete { at: d.page })?;
         }
         Ok(())
     }
@@ -1171,7 +1528,7 @@ impl App {
         let doc = Document::from_page(&src.doc, d.page)?;
         let copies = src.overlays_on(d.page);
         if !d.copy {
-            take_page(src, d.page);
+            src.page_edit(PageOp::Delete { at: d.page })?;
         }
         let mut tab = self.make_tab(doc);
         tab.add_overlays(copies, 0);
@@ -1203,6 +1560,17 @@ impl App {
             self.sign_menu = false;
             return Action::Redraw;
         }
+        if self.find.as_ref().is_some_and(|f| f.focused) {
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 };
+            return match key {
+                VK_RETURN => self.find_step(if shift { -1 } else { 1 }),
+                VK_ESCAPE => {
+                    self.find = None;
+                    Action::Redraw
+                }
+                _ => Action::None, // typed characters arrive through char_input
+            };
+        }
         if key == VK_ESCAPE && matches!(self.drag, Drag::Page(_) | Drag::PagePress { .. }) {
             self.drag = Drag::None;
             return Action::Release(None);
@@ -1228,8 +1596,7 @@ impl App {
                     let mut o = tab.overlays[i].clone();
                     (o.x, o.y) = (o.x + dx, o.y + dy);
                     Self::clamp_to_page(tab, &mut o);
-                    tab.overlays[i] = o;
-                    tab.dirty = true;
+                    tab.change(|t| t.overlays[i] = o);
                     return Action::Redraw;
                 }
                 if key == VK_DELETE || key == VK_BACK {
@@ -1298,6 +1665,17 @@ impl App {
     pub fn char_input(&mut self, unit: u16) -> Action {
         if self.pad.is_some() {
             return Action::None;
+        }
+        if let Some(find) = self.find.as_mut().filter(|f| f.focused) {
+            match char::from_u32(unit as u32) {
+                Some('\u{8}') => {
+                    find.query.pop();
+                }
+                Some(c) if !c.is_control() => find.query.push(c),
+                _ => return Action::None,
+            }
+            self.run_find(true);
+            return Action::Redraw;
         }
         let c = match unit {
             0xD800..=0xDBFF => {
@@ -1381,9 +1759,9 @@ impl App {
                 } else {
                     let [nx, ny, nw, nh] = resize_box(orig, gx, gy, dx, dy, o.keeps_aspect());
                     (o.x, o.y, o.w, o.h) = (nx, ny, nw, nh);
-                    if let Kind::Text { size: s, .. } = &mut o.kind {
+                    if let Kind::Text { style, .. } = &mut o.kind {
                         // Text scales its font; the box follows from that.
-                        *s = (size * nh / orig[3]).max(2.0);
+                        style.size = (size * nh / orig[3]).max(2.0);
                         o.fit_text();
                         if gx < 0 {
                             o.x = orig[0] + orig[2] - o.w;
@@ -1399,7 +1777,6 @@ impl App {
                     return Action::None;
                 }
                 tab.overlays[index] = o;
-                tab.dirty = true;
                 return Action::Redraw;
             }
             Drag::NewHighlight { index, anchor } => {
@@ -1410,7 +1787,6 @@ impl App {
                 let (px, py) = (px.clamp(0.0, pw), py.clamp(0.0, ph));
                 let o = &mut tab.overlays[index];
                 (o.x, o.y, o.w, o.h) = (anchor.0.min(px), anchor.1.min(py), (px - anchor.0).abs(), (py - anchor.1).abs());
-                tab.dirty = true;
                 return Action::Redraw;
             }
             Drag::Pad => return Action::None,
@@ -1523,10 +1899,16 @@ impl App {
             self.sign_menu = false; // a click elsewhere just closes the menu
             return Action::Redraw;
         }
+        if let Some(find) = &mut self.find {
+            find.focused = matches!(hit, Hit::Find(_));
+        }
         match hit {
             Hit::Menu(item) => self.menu_click(item),
             Hit::MenuPanel => Action::None,
             Hit::Tool(b) => self.tool_click(b),
+            Hit::Opt(o) => self.option_click(o),
+            Hit::Find(f) => self.find_click(f),
+            Hit::MenuEdit => Action::EditMenu(r.edit_button.left, r.edit_button.bottom),
             Hit::Editor => self.editor_down(x, y),
             Hit::MenuFile => Action::FileMenu(r.file_button.left, r.file_button.bottom),
             Hit::TabClose(i) => Action::CloseTab(i),
@@ -1590,12 +1972,13 @@ impl App {
             let start = app.to_page_points(page, x, y);
             let Some(tab) = app.active_tab_mut() else { return Action::None };
             let o = &tab.overlays[index];
-            let size = match o.kind {
-                Kind::Text { size, .. } => size,
+            let size = match &o.kind {
+                Kind::Text { style, .. } => style.size,
                 _ => 0.0,
             };
             let orig = [o.x, o.y, o.w, o.h];
             tab.selected = Some(index);
+            tab.begin_change();
             app.drag = Drag::Overlay { index, gx, gy, start, orig, size };
             Action::Capture
         };
@@ -1614,22 +1997,24 @@ impl App {
             Tool::Stamp(i) => self.library.as_ref().and_then(|l| l.items.get(i)).map(|s| (s.image.clone(), s.stamp_size())),
             _ => None,
         };
-        let tool = self.tool;
+        let (tool, text_style, mark_style) = (self.tool, self.text_style, self.mark_style);
         let Some(tab) = self.active_tab_mut() else { return Action::None };
         tab.selected = None;
         match tool {
             Tool::Select => Action::Redraw,
             Tool::Text => {
                 // The click lands in the middle of the first line.
-                let mut o = Overlay::text(page, px, py - TEXT_SIZE * overlay::LINE / 2.0, String::new(), TEXT_SIZE);
+                let y = py - text_style.size * overlay::LINE / 2.0;
+                let mut o = Overlay::text(page, px, y, String::new(), text_style);
                 Self::clamp_to_page(tab, &mut o);
+                let base = tab.overlays.clone();
                 tab.overlays.push(o);
-                tab.selected = Some(tab.overlays.len() - 1);
-                tab.caret = Some(0);
+                tab.start_edit(base, tab.overlays.len() - 1, 0);
                 Action::Redraw
             }
             Tool::Highlight => {
-                tab.overlays.push(Overlay { page, x: px, y: py, w: 0.0, h: 0.0, kind: Kind::Highlight });
+                tab.begin_change();
+                tab.overlays.push(Overlay { page, x: px, y: py, w: 0.0, h: 0.0, kind: Kind::Mark(mark_style) });
                 let index = tab.overlays.len() - 1;
                 tab.selected = Some(index);
                 self.drag = Drag::NewHighlight { index, anchor: (px, py) };
@@ -1639,9 +2024,8 @@ impl App {
                 let Some((img, (w, h))) = stamp else { return Action::None };
                 let mut o = Overlay { page, x: px - w / 2.0, y: py - h / 2.0, w, h, kind: Kind::Image(img) };
                 Self::clamp_to_page(tab, &mut o);
-                tab.overlays.push(o);
+                tab.change(|t| t.overlays.push(o));
                 tab.selected = Some(tab.overlays.len() - 1);
-                tab.dirty = true;
                 Action::Redraw
             }
         }
@@ -1654,8 +2038,8 @@ impl App {
             if let Some(OverlayHit::Body(i)) = self.overlay_at(x, y) {
                 if let Some(tab) = self.active_tab_mut() {
                     if let Kind::Text { text, .. } = &tab.overlays[i].kind {
-                        tab.caret = Some(text.len());
-                        tab.selected = Some(i);
+                        let caret = text.len();
+                        tab.start_edit(tab.overlays.clone(), i, caret);
                         return Action::Redraw;
                     }
                 }
@@ -1684,7 +2068,12 @@ impl App {
         }
         match std::mem::replace(&mut self.drag, Drag::None) {
             Drag::None | Drag::Pad => Action::None,
-            Drag::Overlay { .. } => Action::Release(None),
+            Drag::Overlay { .. } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.end_change();
+                }
+                Action::Release(None)
+            }
             Drag::NewHighlight { index, .. } => {
                 // A click without a drag doesn't leave a speck behind.
                 if let Some(tab) = self.active_tab_mut() {
@@ -1692,6 +2081,7 @@ impl App {
                         tab.overlays.remove(index);
                         tab.selected = None;
                     }
+                    tab.end_change();
                 }
                 Action::Release(None)
             }
@@ -1748,6 +2138,11 @@ impl App {
 
     /// Mouse capture was taken away (alt-tab, etc.).
     pub fn capture_lost(&mut self) {
+        if matches!(self.drag, Drag::Overlay { .. } | Drag::NewHighlight { .. }) {
+            if let Some(tab) = self.active_tab_mut() {
+                tab.end_change();
+            }
+        }
         self.drag = Drag::None;
         if let Some(pad) = &mut self.pad {
             pad.capture_lost();
@@ -1769,6 +2164,7 @@ impl App {
             if let Some((img, g)) = self.stamp_ghost() {
                 img.draw(dc, &g, 0x99);
             }
+            self.paint_find(dc);
             if let Some((_, thumb, _)) = self.hscroll_thumb() {
                 let alpha = match (self.drag, self.hover) {
                     (Drag::HScroll { .. }, _) => t::SLIDER_ALPHA_ACTIVE,
@@ -1827,6 +2223,14 @@ impl App {
         let m = self.m;
         let shadow = m.px(2);
         let e = r.editor;
+        self.refresh_find();
+        let matches: Vec<(usize, [f32; 4], bool)> = self.find.as_ref().map_or(Vec::new(), |f| {
+            f.results
+                .iter()
+                .enumerate()
+                .flat_map(|(i, (page, boxes))| boxes.iter().map(move |b| (*page, *b, f.current == Some(i))))
+                .collect()
+        });
         self.with_view(|tab, view_h| {
             // Re-clamp after resizes and zooms.
             tab.scroll_to(tab.scroll_y, view_h);
@@ -1847,6 +2251,17 @@ impl App {
                     gdi::blit(dc, bmp, x + at(bmp.x0), y + at(bmp.y0), at(bmp.width), at(bmp.height));
                 }
             }
+            for (page, b, current) in matches.iter().filter(|m| visible.contains(&m.0)) {
+                let (ox, oy, s) = Self::page_frame(tab, &e, *page);
+                let pad = 1.0;
+                let r = RECT {
+                    left: (ox + (b[0] - pad) * s).round() as i32,
+                    top: (oy + (b[1] - pad) * s).round() as i32,
+                    right: (ox + (b[0] + b[2] + pad) * s).round() as i32,
+                    bottom: (oy + (b[1] + b[3] + pad) * s).round() as i32,
+                };
+                gdi::multiply(dc, &r, if *current { 0xFF9632 } else { 0xFFD27F });
+            }
             // Overlays after all pages: rendering a page is what reads its saved ones.
             for o in tab.overlays.iter().filter(|o| visible.contains(&o.page)) {
                 let (ox, oy, s) = Self::page_frame(tab, &r.editor, o.page);
@@ -1865,10 +2280,11 @@ impl App {
                 gdi::fill(dc, &edge, t::ACCENT);
             }
             match (tab.caret, &o.kind) {
-                (Some(c), Kind::Text { text, size }) => {
+                (Some(c), Kind::Text { text, style }) => {
+                    let size = &style.size;
                     let line = text[..c].matches('\n').count();
                     let start = text[..c].rfind('\n').map_or(0, |i| i + 1);
-                    let x = b.left + (overlay::text_width(&text[start..c], *size) * s).round() as i32;
+                    let x = b.left + (overlay::text_width(&text[start..c], style) * s).round() as i32;
                     let y = b.top + (line as f32 * overlay::LINE * size * s).round() as i32;
                     let h = (size * overlay::LINE * s).round().max(2.0) as i32;
                     gdi::fill(dc, &rect(x, y, (m.px(1)).max(1), h), t::rgb(0x000000));
@@ -2039,6 +2455,11 @@ impl App {
             gdi::round_fill(dc, &r.file_button, self.m.px(5), t::HOVER_BG);
         }
         gdi::text(dc, self.fonts.ui, t::TEXT, "File", r.file_button, DT_CENTER | DT_VCENTER);
+        if self.hover == Hit::MenuEdit {
+            gdi::round_fill(dc, &r.edit_button, self.m.px(5), t::HOVER_BG);
+        }
+        gdi::text(dc, self.fonts.ui, t::TEXT, "Edit", r.edit_button, DT_CENTER | DT_VCENTER);
+        self.paint_options(dc);
 
         let enabled = self.active_tab().is_some();
         let rects = self.tool_rects();
@@ -2064,6 +2485,117 @@ impl App {
             let label = TOOL_BUTTONS.iter().find(|(k, _)| *k == b).map_or("", |(_, l)| l);
             let color = if !enabled { t::TEXT_FAINT } else if active { t::TEXT_BRIGHT } else { t::TEXT };
             gdi::text(dc, self.fonts.ui, color, label, br, DT_CENTER | DT_VCENTER);
+        }
+    }
+
+    fn paint_options(&self, dc: HDC) {
+        let Some(options) = self.options() else { return };
+        let m = self.m;
+        let rects = self.option_rects();
+        if let Some((_, first)) = rects.first() {
+            let sep = rect(first.left - m.px(11), first.top + m.px(4), 1, first.bottom - first.top - m.px(8));
+            gdi::fill(dc, &sep, t::BORDER);
+        }
+        for &(opt, r) in &rects {
+            let hovered = self.hover == Hit::Opt(opt);
+            let (on, label): (bool, String) = match (&options, opt) {
+                (Options::Text(s), Opt::Family(f)) => (s.family == f, f.label().into()),
+                (Options::Text(_), Opt::SizeDown) => (false, "\u{2212}".into()),
+                (Options::Text(_), Opt::SizeUp) => (false, "+".into()),
+                (Options::Text(s), Opt::Bold) => (s.bold, "B".into()),
+                (Options::Text(s), Opt::Italic) => (s.italic, "I".into()),
+                (Options::Mark(s), Opt::Mark(mk)) => (
+                    s.mark == mk,
+                    match mk {
+                        Mark::Highlight => "Highlight",
+                        Mark::Underline => "Underline",
+                        Mark::Strike => "Strike",
+                    }
+                    .into(),
+                ),
+                _ => (false, String::new()),
+            };
+            let color = match (&options, opt) {
+                (Options::Text(s), Opt::TextColor(i)) => Some((overlay::TEXT_COLORS[i], s.color == overlay::TEXT_COLORS[i])),
+                (Options::Mark(s), Opt::MarkColor(i)) => Some((overlay::MARK_COLORS[i], s.color == overlay::MARK_COLORS[i])),
+                _ => None,
+            };
+            if let Some((c, selected)) = color {
+                let d = m.px(14);
+                let dot = rect((r.left + r.right - d) / 2, (r.top + r.bottom - d) / 2, d, d);
+                if selected || hovered {
+                    let ring = RECT { left: dot.left - m.px(3), top: dot.top - m.px(3), right: dot.right + m.px(3), bottom: dot.bottom + m.px(3) };
+                    gdi::round_fill(dc, &ring, ring.right - ring.left, if selected { t::ACCENT } else { t::TEXT_FAINT });
+                    gdi::round_fill(dc, &RECT { left: ring.left + m.px(2), top: ring.top + m.px(2), right: ring.right - m.px(2), bottom: ring.bottom - m.px(2) }, ring.right - ring.left, t::CHROME_BG);
+                }
+                gdi::round_fill(dc, &dot, d, t::rgb(c));
+                continue;
+            }
+            if on || hovered {
+                gdi::round_fill(dc, &r, m.px(5), if on { t::rgb(0x37373D) } else { t::HOVER_BG });
+            }
+            if on {
+                gdi::fill(dc, &rect(r.left + m.px(4), r.bottom - m.px(2), r.right - r.left - m.px(8), m.px(2)), t::ACCENT);
+            }
+            let font = if opt == Opt::Bold { self.fonts.bold } else { self.fonts.ui };
+            gdi::text(dc, font, if on { t::TEXT_BRIGHT } else { t::TEXT }, &label, r, DT_CENTER | DT_VCENTER);
+        }
+        // The size, between − and +.
+        if let Options::Text(s) = options {
+            let down = rects.iter().find(|(o, _)| *o == Opt::SizeDown).map(|(_, r)| *r);
+            let up = rects.iter().find(|(o, _)| *o == Opt::SizeUp).map(|(_, r)| *r);
+            if let (Some(a), Some(b)) = (down, up) {
+                let label = if s.size.fract().abs() < 0.05 { format!("{:.0}", s.size) } else { format!("{:.1}", s.size) };
+                gdi::text(dc, self.fonts.ui, t::TEXT, &label, RECT { left: a.right, right: b.left, ..a }, DT_CENTER | DT_VCENTER);
+            }
+        }
+    }
+
+    fn paint_find(&self, dc: HDC) {
+        let Some(find) = &self.find else { return };
+        let rects = self.find_rects();
+        let get = |h: FindHit| rects.iter().find(|(k, _)| *k == h).map(|(_, r)| *r).unwrap_or_default();
+        let m = self.m;
+        let bar = get(FindHit::Bar);
+        gdi::fill(dc, &RECT { left: bar.left - 1, top: bar.top - 1, right: bar.right + 1, bottom: bar.bottom + 1 }, t::BORDER);
+        gdi::fill(dc, &bar, t::rgb(0x252526));
+        let input = get(FindHit::Input);
+        gdi::fill(dc, &input, t::rgb(0x313131));
+        if find.focused {
+            self.outline(dc, &input, t::ACCENT);
+        }
+        let text_rect = RECT { left: input.left + m.px(6), right: input.right - m.px(4), ..input };
+        if find.query.is_empty() {
+            gdi::text(dc, self.fonts.ui, t::TEXT_FAINT, "Find", text_rect, DT_LEFT | DT_VCENTER);
+        } else {
+            gdi::text(dc, self.fonts.ui, t::TEXT_BRIGHT, &find.query, text_rect, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        }
+        if find.focused {
+            let x = (text_rect.left + gdi::text_width(self.measure, self.fonts.ui, &find.query) + 1).min(text_rect.right);
+            gdi::fill(dc, &rect(x, input.top + m.px(6), 1.max(m.px(1)), input.bottom - input.top - m.px(12)), t::TEXT_BRIGHT);
+        }
+        let count = match (find.query.is_empty(), find.results.len(), find.current) {
+            (true, _, _) => String::new(),
+            (false, 0, _) => "No results".into(),
+            (false, n, Some(c)) => format!("{} of {}", c + 1, n),
+            (false, n, None) => format!("{n} found"),
+        };
+        let case = get(FindHit::Case);
+        let count_rect = RECT { left: input.right + m.px(6), right: case.left - m.px(4), ..input };
+        let count_color = if find.results.is_empty() && !find.query.is_empty() { t::PDF_ICON } else { t::TEXT_DIM };
+        gdi::text(dc, self.fonts.status, count_color, &count, count_rect, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        for (hit, label, font) in [
+            (FindHit::Case, "Aa", self.fonts.ui),
+            (FindHit::Prev, "\u{2191}", self.fonts.ui),
+            (FindHit::Next, "\u{2193}", self.fonts.ui),
+            (FindHit::Close, t::ICON_CLOSE, self.fonts.icon_small),
+        ] {
+            let r = get(hit);
+            let on = hit == FindHit::Case && find.match_case;
+            if on || self.hover == Hit::Find(hit) {
+                gdi::round_fill(dc, &r, m.px(4), if on { t::rgb(0x2B4F70) } else { t::HOVER_BG });
+            }
+            gdi::text(dc, font, if on { t::TEXT_BRIGHT } else { t::TEXT }, label, r, DT_CENTER | DT_VCENTER);
         }
     }
 
@@ -2132,7 +2664,7 @@ impl App {
         }
         Some(match self.tool {
             Tool::Text => "Click on a page to add text  ·  Double-click text to edit it  ·  Esc: done",
-            Tool::Highlight => "Drag across a page to highlight  ·  Esc: done",
+            Tool::Highlight => "Drag across a page to mark it  ·  Style and color in the strip above  ·  Esc: done",
             Tool::Stamp(_) => "Click to place  ·  Drag to move, corners to resize  ·  Esc: done",
             Tool::Select if tab.selected.is_some() => "Drag to move  ·  Drag handles to resize  ·  Arrows: nudge  ·  Delete: remove",
             Tool::Select => return None,

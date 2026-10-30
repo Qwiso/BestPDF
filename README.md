@@ -36,14 +36,18 @@ cargo run -- path\to\file.pdf
   - Drop on the empty tab bar (or a welcome tab) to start a new document with that page.
   - Moves by default; hold `Ctrl` to copy. `Esc` cancels. A document's last page can only be copied out.
   - Edited tabs show ●. Closing them, or the window, asks to save first.
-- **Text, highlights, signatures** (tool buttons next to File):
-  - **Text:** click a page and type; `Enter` for a new line, `Esc` or click outside when done. Double-click text to edit it.
-  - **Highlight:** drag across a page.
+- **Rotate and delete pages:** right-click a page (in the view or the minimap), or use the Edit menu for the page in view. `Ctrl+R` / `Ctrl+Shift+R` rotate clockwise / counterclockwise. Text, marks and signatures on a rotated page move with it and stay upright.
+- **Undo / redo:** `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`). Each tab has its own history of page edits (move, copy, rotate, delete, pages dragged in or out) and changes to text, marks and signatures (a typing session is one step). Saving starts a fresh history.
+- **Find:** `Ctrl+F` opens a find bar over the page view. Matches are marked on every page; `Enter` / `F3` next, `Shift+Enter` / `Shift+F3` previous, **Aa** for match case, `Esc` closes.
+- **Text, highlights, signatures** (tool buttons next to Edit):
+  - **Text:** click a page and type; `Enter` for a new line, `Esc` or click outside when done. Double-click text to edit it. The options strip sets font (Sans / Serif / Mono, the PDF standard fonts, so nothing is embedded), size, bold, italic and color, for the selected text or the next one you add.
+  - **Highlight:** drag across a page. The options strip switches between highlight, underline and strikethrough, in six colors. Highlights multiply over the page like a highlighter pen, on screen and in the saved PDF.
   - **Sign ▾:** your saved signatures and initials. **+ New** opens a pad to draw one with the mouse, or import a picture (paper turns transparent and the ink is trimmed). Pick one and it acts as a stamp: every click places a copy. Hover a saved one to delete it.
   - Anything placed can be dragged and resized with any tool: corners scale text (font size) and signatures (keeping proportions), highlights stretch from any side. Arrows nudge (`Shift`: further), `Delete` removes, `Esc` returns to Select.
   - **On save** Best PDF asks whether to keep them **editable** (the default: saved as annotations, movable again when reopened, here or in other editors) or **flatten** them into the page. "Always do this", or File › When Saving Text & Signatures, makes the choice stick. Printing always flattens.
 - **Single window:** launching with files while Best PDF is running opens them as tabs in the existing window. Open dialog and drag-drop accept multiple files.
 - **File menu** (`Alt+F`): New Tab `Ctrl+T` (welcome screen; the next file you open fills it) · New Document `Ctrl+N` (blank Letter page) · Open `Ctrl+O` · Close `Ctrl+W` · Save `Ctrl+S` · Save As `Ctrl+Shift+S` · Print `Ctrl+P`
+- **Edit menu** (`Alt+E`): Undo · Redo · Find · Find Next / Previous · Rotate Page Clockwise / Counterclockwise · Delete Page
 - **Open:** also by dragging files in, or passing paths on the command line
 - **Scroll:** wheel, scrollbar, arrows, `PgUp`/`PgDn`/`Space`, `Home`/`End`. Sideways (when zoomed in): `Shift`+wheel, tilt wheel / touchpad, `←`/`→`, or the bar along the bottom.
 - **Zoom:** the widest page fills 75% of the page view by default; zoom from 10% to 250% of the view's width. `Ctrl`+wheel zooms around the pointer; `Ctrl`+`=` / `Ctrl`+`-` step, `Ctrl`+`0` resets. The status bar has − / + and the current zoom (click it to reset). Each tab keeps its own zoom.

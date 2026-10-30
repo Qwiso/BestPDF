@@ -63,9 +63,14 @@ pub fn font(face: &str, logical_size: i32, dpi: u32, weight: i32) -> HFONT {
 
 /// A font whose em is `px` device pixels tall.
 pub fn font_px(face: &str, px: i32, weight: i32) -> HFONT {
+    font_styled(face, px, weight, false)
+}
+
+pub fn font_styled(face: &str, px: i32, weight: i32, italic: bool) -> HFONT {
     let mut lf = LOGFONTW {
         lfHeight: -px,
         lfWeight: weight,
+        lfItalic: italic as u8,
         lfQuality: CLEARTYPE_QUALITY,
         ..Default::default()
     };
@@ -149,11 +154,61 @@ impl BackBuffer {
         *slot = None; // drop the old one first
         unsafe {
             let dc = CreateCompatibleDC(Some(screen));
-            let bitmap = CreateCompatibleBitmap(screen, w, h);
+            // A DIB section, so `multiply` can reach the pixels.
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+                .unwrap_or_else(|_| CreateCompatibleBitmap(screen, w, h));
             SelectObject(dc, bitmap.into());
             *slot = Some(BackBuffer { dc, bitmap, w, h });
         }
         slot.as_ref().unwrap().dc
+    }
+}
+
+/// Multiplies the pixels under `r` by `color` (0xRRGGBB), like a highlighter
+/// pen: white turns that color, black stays black. Works on DCs drawing into
+/// a 32-bit DIB section (the back buffer); elsewhere falls back to ANDing,
+/// which is exact only for 0x00/0xFF channels.
+pub fn multiply(dc: HDC, r: &RECT, color: u32) {
+    let (cr, cg, cb) = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+    unsafe {
+        let bitmap = GetCurrentObject(dc, OBJ_BITMAP);
+        let mut ds = DIBSECTION::default();
+        let got = GetObjectW(bitmap, size_of::<DIBSECTION>() as i32, Some(&mut ds as *mut DIBSECTION as *mut _));
+        if got as usize != size_of::<DIBSECTION>() || ds.dsBm.bmBits.is_null() || ds.dsBm.bmBitsPixel != 32 {
+            let old = SelectObject(dc, GetStockObject(DC_BRUSH));
+            SetDCBrushColor(dc, crate::theme::rgb(color));
+            let _ = PatBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, ROP_CODE(0x00A0_00C9)); // DPa
+            SelectObject(dc, old);
+            return;
+        }
+        let _ = GdiFlush();
+        let (w, h) = (ds.dsBm.bmWidth, ds.dsBm.bmHeight.abs());
+        let stride = ds.dsBm.bmWidthBytes as isize;
+        // Every DIB section here is created top-down (GetObject reports the
+        // height as positive either way, so it can't tell us).
+        let bits = ds.dsBm.bmBits as *mut u8;
+        let (x0, x1) = (r.left.max(0), r.right.min(w));
+        for y in r.top.max(0)..r.bottom.min(h) {
+            let px = std::slice::from_raw_parts_mut(bits.offset(y as isize * stride + x0 as isize * 4), ((x1 - x0).max(0) * 4) as usize);
+            for p in px.chunks_exact_mut(4) {
+                p[0] = (p[0] as u32 * cb / 255) as u8;
+                p[1] = (p[1] as u32 * cg / 255) as u8;
+                p[2] = (p[2] as u32 * cr / 255) as u8;
+            }
+        }
     }
 }
 
