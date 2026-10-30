@@ -744,15 +744,19 @@ impl App {
                 Action::Redraw
             }
             Hit::Minimap => {
-                if let Some(page) = self.page_at(x, y) {
-                    self.drag = Drag::PagePress { page, x, y };
-                    return Action::Capture;
-                }
-                // Between pages: scrub like VS Code's minimap.
                 let view_h = self.view_h();
                 let Some(tab) = self.active_tab() else { return Action::None };
                 let geo = self.mini_geo(tab, &r.minimap, view_h);
-                if !gdi::contains(&geo.slider, x, y) {
+                let on_slider = gdi::contains(&geo.slider, x, y);
+                // A page outside the slider: click to jump, drag to rearrange.
+                if !on_slider {
+                    if let Some(page) = self.page_at(x, y) {
+                        self.drag = Drag::PagePress { page, x, y };
+                        return Action::Capture;
+                    }
+                }
+                // On the slider or between pages: scrub like VS Code's minimap.
+                if !on_slider {
                     // Jump so the clicked spot is centered, then keep dragging from there.
                     let content_y = ((y - r.minimap.top + geo.offset) as f32 / geo.f) as i32;
                     self.scroll_to(content_y - view_h / 2);

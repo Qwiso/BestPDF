@@ -26,8 +26,8 @@ cargo run -- path\to\file.pdf
 
 - **Layout (VS Code style, Dark Modern colors):** menu strip · tabs · page view · minimap of the whole file · slim scrollbar · status bar (page N of M, page size)
 - **Tabs:** every file opens in its own tab and keeps its own scroll position. `Ctrl+Tab` / `Ctrl+Shift+Tab` (or `Ctrl+PgDn/PgUp`) to switch, middle-click or × to close. Opening a file that's already open focuses its tab.
-- **Minimap (page strip):** click a page to jump to it; drag between pages to scrub. Long files scroll the minimap proportionally.
-- **Rearrange pages:** drag a page in the minimap. A blue line shows where it lands.
+- **Minimap (page strip):** click a page to jump to it; drag the highlighted slider (or between pages) to scrub. Long files scroll the minimap proportionally.
+- **Rearrange pages:** drag a page in the minimap (outside the slider). A blue line shows where it lands.
   - Drop on another tab to append it to that PDF, or rest on the tab for a moment to open it and drop at an exact spot.
   - Drop on the empty tab bar (or a welcome tab) to start a new document with that page.
   - Moves by default; hold `Ctrl` to copy. `Esc` cancels. A document's last page can only be copied out.
