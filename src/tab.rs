@@ -1,5 +1,6 @@
 //! One open document: its scroll position, page layout and rendered bitmaps.
-//! Layout is in content pixels: x within the editor, y from the top of the document.
+//! Layout is in content pixels from the document's top-left corner; the view
+//! shows the part at (scroll_x, scroll_y).
 
 use std::collections::HashMap;
 
@@ -17,17 +18,28 @@ pub struct PageRect {
 
 #[derive(Default)]
 struct Layout {
-    key: (i32, u32), // (editor width, dpi) it was computed for
+    key: (i32, u32, u32), // (editor width, dpi, zoom bits) it was computed for
     pages: Vec<PageRect>,
     total_h: i32,
+    total_w: i32,
     max_w: i32,
 }
+
+/// Zoom = width of the widest page as a fraction of the page view's width.
+pub const ZOOM_DEFAULT: f32 = 0.75;
+pub const ZOOM_MIN: f32 = 0.10;
+pub const ZOOM_MAX: f32 = 2.50;
+/// Pages bigger than this many pixels are rendered only around what's on
+/// screen, so high zoom doesn't need hundreds of MB per page.
+const WHOLE_PAGE_PIXELS: i64 = 8_000_000;
 
 pub struct Tab {
     pub doc: Document,
     /// Shown as "Untitled-N" until first saved.
     pub untitled: Option<u32>,
     pub scroll_y: i32,
+    pub scroll_x: i32,
+    pub zoom: f32,
     /// Edited since the last save (shown as ● on the tab).
     pub dirty: bool,
     /// Text, highlights and signatures placed on the pages.
@@ -46,6 +58,8 @@ impl Tab {
             doc,
             untitled,
             scroll_y: 0,
+            scroll_x: 0,
+            zoom: ZOOM_DEFAULT,
             dirty: false,
             overlays: Vec::new(),
             selected: None,
@@ -148,19 +162,21 @@ impl Tab {
         self.thumbs.get(&i)
     }
 
-    /// Fit-to-width layout, capped so pages stay readable on wide monitors.
+    /// Pages stacked vertically, the widest `zoom` × the view's width, each
+    /// centered. Wider than the view, the document scrolls sideways.
     pub fn ensure_layout(&mut self, editor_w: i32, m: Metrics) {
-        if self.layout.key == (editor_w, m.dpi) && !self.layout.pages.is_empty() {
+        let key = (editor_w, m.dpi, self.zoom.to_bits());
+        if self.layout.key == key && !self.layout.pages.is_empty() {
             return;
         }
         let margin = m.px(theme::PAGE_MARGIN);
         let gap = m.px(theme::PAGE_GAP);
-        let avail = (editor_w - 2 * margin).clamp(m.px(100), m.px(theme::MAX_PAGE_W));
         let widest = self.doc.page_sizes.iter().map(|s| s.0).fold(1.0f32, f32::max);
-        let scale = avail as f32 / widest;
+        let scale = (editor_w as f32 * self.zoom).max(1.0) / widest;
+        let max_w = ((widest * scale).round() as i32).max(1);
+        let total_w = editor_w.max(max_w + 2 * margin);
 
         let mut y = margin;
-        let mut max_w = 1;
         let pages = self
             .doc
             .page_sizes
@@ -168,13 +184,12 @@ impl Tab {
             .map(|&(pw, ph)| {
                 let w = (pw * scale).round().max(1.0) as i32;
                 let h = (ph * scale).round().max(1.0) as i32;
-                let r = PageRect { x: (editor_w - w) / 2, y, w, h };
+                let r = PageRect { x: (total_w - w) / 2, y, w, h };
                 y += h + gap;
-                max_w = max_w.max(w);
                 r
             })
             .collect();
-        self.layout = Layout { key: (editor_w, m.dpi), pages, total_h: y - gap + margin, max_w };
+        self.layout = Layout { key, pages, total_h: y - gap + margin, total_w, max_w };
     }
 
     pub fn pages(&self) -> &[PageRect] {
@@ -189,8 +204,24 @@ impl Tab {
         self.layout.max_w
     }
 
+    pub fn content_w(&self) -> i32 {
+        self.layout.total_w
+    }
+
     pub fn max_scroll(&self, view_h: i32) -> i32 {
         (self.layout.total_h - view_h).max(0)
+    }
+
+    pub fn max_scroll_x(&self, view_w: i32) -> i32 {
+        (self.layout.total_w - view_w).max(0)
+    }
+
+    /// Clamps and sets the horizontal scroll offset; returns true if it changed.
+    pub fn scroll_x_to(&mut self, x: i32, view_w: i32) -> bool {
+        let x = x.clamp(0, self.max_scroll_x(view_w));
+        let changed = x != self.scroll_x;
+        self.scroll_x = x;
+        changed
     }
 
     /// Clamps and sets the scroll offset; returns true if it changed.
@@ -219,30 +250,45 @@ impl Tab {
         first..last.max(first)
     }
 
-    /// The bitmap for page `i` at width `w`. Renders when missing or stale if
-    /// `render` is set; otherwise may return a stale bitmap to stretch.
-    pub fn page(&mut self, i: usize, w: i32, render: bool) -> Option<&PageBitmap> {
-        let bmp = Self::cached(&mut self.doc, &mut self.pages, i, w, render);
+    /// The bitmap for page `i` at width `w`, covering at least `visible`
+    /// (x0, y0, x1, y1 in that page's pixels). Renders when missing or stale
+    /// if `render` is set; otherwise may return a stale bitmap to stretch.
+    pub fn page(&mut self, i: usize, w: i32, visible: (i32, i32, i32, i32), render: bool) -> Option<&PageBitmap> {
+        let h = self.doc.page_height(i, w);
+        let region = if w as i64 * h as i64 <= WHOLE_PAGE_PIXELS {
+            None
+        } else {
+            // A screenful of slack around what's visible, so scrolling a bit
+            // doesn't re-render.
+            let (x0, y0, x1, y1) = visible;
+            let (sw, sh) = (x1 - x0, y1 - y0);
+            Some((x0 - sw / 2, y0 - sh, x1 + sw / 2, y1 + sh))
+        };
+        let bmp = Self::cached(&mut self.doc, &mut self.pages, i, w, visible, region, render);
         self.overlays.append(&mut self.doc.found);
         bmp
     }
 
     pub fn thumb(&mut self, i: usize, w: i32, render: bool) -> Option<&PageBitmap> {
-        let bmp = Self::cached(&mut self.doc, &mut self.thumbs, i, w, render);
+        let all = (0, 0, w, self.doc.page_height(i, w));
+        let bmp = Self::cached(&mut self.doc, &mut self.thumbs, i, w, all, None, render);
         self.overlays.append(&mut self.doc.found);
         bmp
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cached<'a>(
         doc: &mut Document,
         cache: &'a mut HashMap<usize, PageBitmap>,
         i: usize,
         w: i32,
+        need: (i32, i32, i32, i32),
+        region: Option<(i32, i32, i32, i32)>,
         render: bool,
     ) -> Option<&'a PageBitmap> {
-        let stale = cache.get(&i).is_none_or(|b| b.width != w);
+        let stale = cache.get(&i).is_none_or(|b| !b.covers(w, need));
         if stale && render {
-            if let Ok(bmp) = doc.render(i, w) {
+            if let Ok(bmp) = doc.render(i, w, region) {
                 cache.insert(i, bmp);
             }
         }

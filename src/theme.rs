@@ -34,7 +34,6 @@ pub const MINIMAP_W: i32 = 110;
 pub const SCROLLBAR_W: i32 = 14;
 pub const PAGE_MARGIN: i32 = 16;
 pub const PAGE_GAP: i32 = 12;
-pub const MAX_PAGE_W: i32 = 1280;
 pub const LINE_STEP: i32 = 48;
 
 /// Icon glyphs from the "Segoe MDL2 Assets" font (ships with Windows 10/11).

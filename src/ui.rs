@@ -18,7 +18,7 @@ use crate::gdi::{self, rect, BackBuffer, Tint};
 use crate::overlay::{self, Image, Kind, Overlay};
 use crate::signature::{Library, SigKind};
 use crate::signpad::{PadEvent, SignPad};
-use crate::tab::Tab;
+use crate::tab::{Tab, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN};
 use crate::theme::{self as t, Metrics};
 
 pub enum Action {
@@ -168,7 +168,22 @@ enum Hit {
     Editor,
     Minimap,
     Scrollbar,
+    /// The horizontal scrollbar along the bottom of the page view.
+    HScroll,
+    Zoom(ZoomButton),
 }
+
+/// Zoom controls in the status bar.
+#[derive(Clone, Copy, PartialEq)]
+enum ZoomButton {
+    Out,
+    /// The percentage: click to go back to the default.
+    Reset,
+    In,
+}
+
+/// Zoom steps for the keyboard and the status bar buttons.
+const ZOOM_STEPS: [f32; 12] = [0.10, 0.25, 0.33, 0.50, 0.60, 0.75, 0.90, 1.00, 1.25, 1.50, 2.00, 2.50];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
@@ -176,6 +191,7 @@ enum Drag {
     /// `grab` = pointer offset from the top of the slider/thumb.
     Minimap { grab: i32 },
     Scrollbar { grab: i32 },
+    HScroll { grab: i32 },
     /// Pressed on a minimap page; a click jumps there, moving the pointer
     /// starts a page drag.
     PagePress { page: usize, x: i32, y: i32 },
@@ -620,6 +636,12 @@ impl App {
             }
             return Hit::TabStrip;
         }
+        if let Some(&(b, _)) = self.zoom_rects().iter().find(|(_, r)| gdi::contains(r, x, y)) {
+            return Hit::Zoom(b);
+        }
+        if self.hscroll_thumb().is_some_and(|(track, _, _)| gdi::contains(&track, x, y)) {
+            return Hit::HScroll;
+        }
         if gdi::contains(&r.minimap, x, y) {
             return Hit::Minimap;
         }
@@ -692,7 +714,7 @@ impl App {
     fn page_frame(tab: &Tab, editor: &RECT, i: usize) -> (f32, f32, f32) {
         let p = tab.pages()[i];
         let pw = tab.doc.page_sizes.get(i).map_or(1.0, |s| s.0);
-        (p.x as f32, (editor.top + p.y - tab.scroll_y) as f32, p.w as f32 / pw)
+        ((editor.left + p.x - tab.scroll_x) as f32, (editor.top + p.y - tab.scroll_y) as f32, p.w as f32 / pw)
     }
 
     /// The page under an editor point, and that point in page points.
@@ -705,7 +727,7 @@ impl App {
         for i in tab.pages_in(tab.scroll_y, tab.scroll_y + (e.bottom - e.top)) {
             let (ox, oy, s) = Self::page_frame(tab, &e, i);
             let p = tab.pages()[i];
-            if gdi::contains(&rect(p.x, oy as i32, p.w, p.h), x, y) {
+            if gdi::contains(&rect(ox as i32, oy as i32, p.w, p.h), x, y) {
                 return Some((i, (x as f32 - ox) / s, (y as f32 - oy) / s));
             }
         }
@@ -869,6 +891,103 @@ impl App {
             }
         }
         Action::Redraw
+    }
+
+    // ---- zoom --------------------------------------------------------------
+
+    /// Sets the active tab's zoom, keeping the document point under client
+    /// point `anchor` (default: the middle of the page view) where it is.
+    pub fn set_zoom(&mut self, zoom: f32, anchor: Option<(i32, i32)>) -> Action {
+        self.sync_layout();
+        let e = self.regions().editor;
+        let (ax, ay) = anchor.unwrap_or(((e.left + e.right) / 2, (e.top + e.bottom) / 2));
+        let (vx, vy) = (ax - e.left, ay - e.top);
+        let m = self.m;
+        let Some(tab) = self.active_tab_mut() else { return Action::None };
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if zoom == tab.zoom || tab.pages().is_empty() {
+            return Action::None;
+        }
+        // Remember the anchor as a fraction of the page under (or nearest) it.
+        let (cx, cy) = (tab.scroll_x + vx, tab.scroll_y + vy);
+        let i = tab.pages().iter().position(|p| p.y + p.h >= cy).unwrap_or(tab.pages().len() - 1);
+        let p = tab.pages()[i];
+        let (fx, fy) = ((cx - p.x) as f32 / p.w as f32, (cy - p.y) as f32 / p.h as f32);
+        tab.zoom = zoom;
+        let view = (e.right - e.left, e.bottom - e.top);
+        tab.ensure_layout(view.0, m);
+        let p = tab.pages()[i];
+        tab.scroll_x_to(p.x + (fx * p.w as f32).round() as i32 - vx, view.0);
+        tab.scroll_to(p.y + (fy * p.h as f32).round() as i32 - vy, view.1);
+        Action::Redraw
+    }
+
+    /// One zoom step in (`dir` > 0) or out.
+    pub fn zoom_step(&mut self, dir: i32) -> Action {
+        let Some(z) = self.active_tab().map(|t| t.zoom) else { return Action::None };
+        let next = if dir > 0 {
+            ZOOM_STEPS.iter().copied().find(|&s| s > z + 0.001).unwrap_or(ZOOM_MAX)
+        } else {
+            ZOOM_STEPS.iter().rev().copied().find(|&s| s < z - 0.001).unwrap_or(ZOOM_MIN)
+        };
+        self.set_zoom(next, None)
+    }
+
+    pub fn zoom_reset(&mut self) -> Action {
+        self.set_zoom(ZOOM_DEFAULT, None)
+    }
+
+    /// Zoom controls in the status bar: − 75% +, left of the page size.
+    fn zoom_rects(&self) -> Vec<(ZoomButton, RECT)> {
+        let Some(tab) = self.active_tab() else { return Vec::new() };
+        let r = self.regions();
+        let s = r.status;
+        let m = self.m;
+        let size_w = gdi::text_width(self.measure, self.fonts.status, &self.size_label(tab, &r));
+        let right = s.right - m.px(12) - size_w - m.px(20);
+        let (bw, pw) = (m.px(22), m.px(48));
+        let (top, h) = (s.top + 1, s.bottom - s.top - 1);
+        vec![
+            (ZoomButton::Out, rect(right - 2 * bw - pw, top, bw, h)),
+            (ZoomButton::Reset, rect(right - bw - pw, top, pw, h)),
+            (ZoomButton::In, rect(right - bw, top, bw, h)),
+        ]
+    }
+
+    /// "8.50 × 11.00 in      PDF" for the current page.
+    fn size_label(&self, tab: &Tab, r: &Regions) -> String {
+        let current = tab.current_page(r.editor.bottom - r.editor.top);
+        let (pw, ph) = tab.doc.page_sizes.get(current).copied().unwrap_or_default();
+        format!("{:.2} × {:.2} in      PDF", pw / 72.0, ph / 72.0)
+    }
+
+    /// Horizontal scrollbar when pages are wider than the view:
+    /// (track, thumb, travel in px).
+    fn hscroll_thumb(&self) -> Option<(RECT, RECT, i32)> {
+        let tab = self.active_tab()?;
+        let e = self.regions().editor;
+        let view_w = e.right - e.left;
+        let max = tab.max_scroll_x(view_w);
+        if max == 0 {
+            return None;
+        }
+        let h = self.m.px(t::SCROLLBAR_W);
+        let track = rect(e.left, e.bottom - h, view_w, h);
+        let tw = ((view_w as i64 * view_w as i64 / tab.content_w().max(1) as i64) as i32).clamp(self.m.px(20).min(view_w), view_w);
+        let travel = view_w - tw;
+        let left = e.left + (tab.scroll_x as i64 * travel as i64 / max as i64) as i32;
+        let pad = self.m.px(3);
+        Some((track, RECT { left, top: track.top + pad, right: left + tw, bottom: track.bottom - pad }, travel))
+    }
+
+    fn scroll_x_by(&mut self, dx: i32) -> Action {
+        let e = self.regions().editor;
+        let Some(tab) = self.active_tab_mut() else { return Action::None };
+        if tab.scroll_x_to(tab.scroll_x.saturating_add(dx), e.right - e.left) {
+            Action::Redraw
+        } else {
+            Action::None
+        }
     }
 
     // ---- scrolling -------------------------------------------------------
@@ -1136,6 +1255,8 @@ impl App {
         match key {
             VK_UP => self.scroll_by(-line),
             VK_DOWN => self.scroll_by(line),
+            VK_LEFT => self.scroll_x_by(-line),
+            VK_RIGHT => self.scroll_x_by(line),
             VK_PRIOR => self.scroll_by(-page),
             VK_NEXT | VK_SPACE => self.scroll_by(page),
             VK_HOME => self.scroll_to(0),
@@ -1229,7 +1350,20 @@ impl App {
             self.clamp_tab_scroll();
             return Action::Redraw;
         }
-        self.scroll_by(-delta * self.m.px(t::LINE_STEP) * 3 / 120)
+        if ctrl_down() {
+            let z = self.active_tab().map_or(ZOOM_DEFAULT, |t| t.zoom);
+            return self.set_zoom(z * 1.1f32.powf(delta as f32 / 120.0), Some((x, y)));
+        }
+        let step = -delta * self.m.px(t::LINE_STEP) * 3 / 120;
+        if unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 } {
+            return self.scroll_x_by(step);
+        }
+        self.scroll_by(step)
+    }
+
+    /// Tilt wheel / touchpad sideways scrolling (WM_MOUSEHWHEEL).
+    pub fn hwheel(&mut self, delta: i32) -> Action {
+        self.scroll_x_by(delta * self.m.px(t::LINE_STEP) * 3 / 120)
     }
 
     pub fn mouse_move(&mut self, x: i32, y: i32) -> Action {
@@ -1290,6 +1424,14 @@ impl App {
                 let k = self.mini_geo(tab, &r.minimap, self.view_h()).k;
                 let slider_top = y - grab - r.minimap.top;
                 return self.scroll_to((slider_top as f32 / k).round() as i32);
+            }
+            Drag::HScroll { grab } => {
+                let Some((track, _, travel)) = self.hscroll_thumb() else { return Action::None };
+                let view_w = track.right - track.left;
+                let Some(max) = self.active_tab().map(|t| t.max_scroll_x(view_w)) else { return Action::None };
+                let pos = (x - grab - track.left) as i64 * max as i64 / travel.max(1) as i64;
+                let Some(tab) = self.active_tab_mut() else { return Action::None };
+                return if tab.scroll_x_to(pos as i32, view_w) { Action::Redraw } else { Action::None };
             }
             Drag::Scrollbar { grab } => {
                 let r = self.regions();
@@ -1425,6 +1567,21 @@ impl App {
                 let slider = self.mini_geo(tab, &r.minimap, view_h).slider;
                 self.drag = Drag::Minimap { grab: y - slider.top };
                 Action::Capture
+            }
+            Hit::Zoom(ZoomButton::Out) => self.zoom_step(-1),
+            Hit::Zoom(ZoomButton::In) => self.zoom_step(1),
+            Hit::Zoom(ZoomButton::Reset) => self.zoom_reset(),
+            Hit::HScroll => {
+                let Some((track, thumb, _)) = self.hscroll_thumb() else { return Action::None };
+                let page = track.right - track.left - self.m.px(t::LINE_STEP);
+                if x < thumb.left {
+                    self.scroll_x_by(-page)
+                } else if x >= thumb.right {
+                    self.scroll_x_by(page)
+                } else {
+                    self.drag = Drag::HScroll { grab: x - thumb.left };
+                    Action::Capture
+                }
             }
             Hit::Scrollbar => {
                 let view_h = self.view_h();
@@ -1572,7 +1729,7 @@ impl App {
                 Action::Release(None)
             }
             Drag::Page(d) => Action::Release(self.drop_page(d).err()),
-            Drag::Minimap { .. } | Drag::Scrollbar { .. } => Action::Release(None),
+            Drag::Minimap { .. } | Drag::Scrollbar { .. } | Drag::HScroll { .. } => Action::Release(None),
         }
     }
 
@@ -1637,6 +1794,14 @@ impl App {
             if let Some((img, g)) = self.stamp_ghost() {
                 img.draw(dc, &g, 0x99);
             }
+            if let Some((_, thumb, _)) = self.hscroll_thumb() {
+                let alpha = match (self.drag, self.hover) {
+                    (Drag::HScroll { .. }, _) => t::SLIDER_ALPHA_ACTIVE,
+                    (_, Hit::HScroll) => t::SLIDER_ALPHA_HOVER,
+                    _ => t::SLIDER_ALPHA_HOVER - 0x10,
+                };
+                self.tint.fill(dc, &thumb, t::SLIDER, alpha);
+            }
             self.paint_minimap(dc, &r);
             self.paint_scrollbar(dc, &r);
         } else {
@@ -1686,17 +1851,25 @@ impl App {
         let render = !self.live_resize;
         let m = self.m;
         let shadow = m.px(2);
+        let e = r.editor;
         self.with_view(|tab, view_h| {
-            tab.scroll_to(tab.scroll_y, view_h); // re-clamp after resizes
+            // Re-clamp after resizes and zooms.
+            tab.scroll_to(tab.scroll_y, view_h);
+            tab.scroll_x_to(tab.scroll_x, e.right - e.left);
             let top = tab.scroll_y;
             let visible = tab.pages_in(top, top + view_h);
             for i in visible.clone() {
                 let p = tab.pages()[i];
-                let y = r.editor.top + p.y - top;
-                gdi::fill(dc, &rect(p.x + shadow, y + shadow, p.w, p.h), t::PAGE_SHADOW);
-                match tab.page(i, p.w, render) {
-                    Some(bmp) => gdi::blit(dc, bmp, p.x, y, p.w, p.h),
-                    None => gdi::fill(dc, &rect(p.x, y, p.w, p.h), t::WHITE),
+                let (x, y) = (e.left + p.x - tab.scroll_x, e.top + p.y - top);
+                gdi::fill(dc, &rect(x + shadow, y + shadow, p.w, p.h), t::PAGE_SHADOW);
+                gdi::fill(dc, &rect(x, y, p.w, p.h), t::WHITE);
+                // The part of the page on screen, in the page's own pixels.
+                let shown = (e.left.max(x) - x, e.top.max(y) - y, e.right.min(x + p.w) - x, e.bottom.min(y + p.h) - y);
+                if let Some(bmp) = tab.page(i, p.w, shown, render) {
+                    // 1:1 normally; stretched while a window-edge drag skips rendering.
+                    let k = p.w as f32 / bmp.page_w as f32;
+                    let at = |v: i32| (v as f32 * k).round() as i32;
+                    gdi::blit(dc, bmp, x + at(bmp.x0), y + at(bmp.y0), at(bmp.width), at(bmp.height));
                 }
             }
             // Overlays after all pages: rendering a page is what reads its saved ones.
@@ -2017,11 +2190,21 @@ impl App {
         if let Some(hint) = self.hint() {
             left = format!("{left}      {hint}");
         }
-        let left_rect = RECT { left: pad, right: s.right - self.m.px(190), ..s };
+        let left_rect = RECT { left: pad, right: self.zoom_rects().first().map_or(s.right, |(_, z)| z.left) - pad, ..s };
         gdi::text(dc, self.fonts.status, t::TEXT, &left, left_rect, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
-        let (pw, ph) = tab.doc.page_sizes.get(current).copied().unwrap_or_default();
-        let right = format!("{:.2} × {:.2} in      PDF", pw / 72.0, ph / 72.0);
+        let right = self.size_label(tab, r);
         gdi::text(dc, self.fonts.status, t::TEXT, &right, RECT { right: s.right - pad, ..s }, DT_RIGHT | DT_VCENTER);
+        for (b, br) in self.zoom_rects() {
+            if self.hover == Hit::Zoom(b) {
+                gdi::fill(dc, &br, t::HOVER_BG);
+            }
+            let label = match b {
+                ZoomButton::Out => "\u{2212}".to_string(),
+                ZoomButton::In => "+".to_string(),
+                ZoomButton::Reset => format!("{:.0}%", tab.zoom * 100.0),
+            };
+            gdi::text(dc, self.fonts.status, t::TEXT, &label, br, DT_CENTER | DT_VCENTER);
+        }
     }
 
     fn paint_watermark(&self, dc: HDC, e: &RECT) {

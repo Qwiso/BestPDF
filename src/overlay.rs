@@ -167,10 +167,14 @@ impl Image {
         Rc::new(Self { w, h, bgra, scaled: RefCell::new(Vec::new()) })
     }
 
-    /// Resamples to w×h (box filter when shrinking), premultiplied BGRA.
+    /// Resamples to w×h, premultiplied BGRA: box filter when shrinking,
+    /// bilinear when enlarging (zoomed in past the image's resolution).
     pub fn resample(&self, w: i32, h: i32) -> Vec<u8> {
         let (sw, sh) = (self.w as usize, self.h as usize);
         let (w, h) = (w.max(1) as usize, h.max(1) as usize);
+        if w > sw || h > sh {
+            return self.bilinear(w, h);
+        }
         let mut out = vec![0u8; w * h * 4];
         for ty in 0..h {
             let y0 = ty * sh / h;
@@ -193,6 +197,34 @@ impl Image {
                 let o = &mut out[(ty * w + tx) * 4..][..4];
                 for c in 0..4 {
                     o[c] = (acc[c] / n) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    fn bilinear(&self, w: usize, h: usize) -> Vec<u8> {
+        let (sw, sh) = (self.w as usize, self.h as usize);
+        let premul = |x: usize, y: usize| {
+            let p = &self.bgra[(y * sw + x) * 4..][..4];
+            let a = p[3] as f32 / 255.0;
+            [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, p[3] as f32]
+        };
+        let mut out = vec![0u8; w * h * 4];
+        for ty in 0..h {
+            let fy = ((ty as f32 + 0.5) * sh as f32 / h as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
+            let (y0, ky) = (fy as usize, fy.fract());
+            let y1 = (y0 + 1).min(sh - 1);
+            for tx in 0..w {
+                let fx = ((tx as f32 + 0.5) * sw as f32 / w as f32 - 0.5).clamp(0.0, (sw - 1) as f32);
+                let (x0, kx) = (fx as usize, fx.fract());
+                let x1 = (x0 + 1).min(sw - 1);
+                let (a, b, c, d) = (premul(x0, y0), premul(x1, y0), premul(x0, y1), premul(x1, y1));
+                let o = &mut out[(ty * w + tx) * 4..][..4];
+                for i in 0..4 {
+                    let top = a[i] + (b[i] - a[i]) * kx;
+                    let bottom = c[i] + (d[i] - c[i]) * kx;
+                    o[i] = (top + (bottom - top) * ky).round() as u8;
                 }
             }
         }

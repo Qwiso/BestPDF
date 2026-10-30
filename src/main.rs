@@ -55,6 +55,9 @@ const ID_NEW_TAB: u16 = 109;
 const ID_SAVE_ASK: u16 = 110;
 const ID_SAVE_ANNOTATE: u16 = 111;
 const ID_SAVE_FLATTEN: u16 = 112;
+const ID_ZOOM_IN: u16 = 113;
+const ID_ZOOM_OUT: u16 = 114;
+const ID_ZOOM_RESET: u16 = 115;
 /// Timer that drives page drags (spring-loaded tabs, auto-scroll).
 const DRAG_TIMER: usize = 1;
 /// Commands that need a document in the active tab; greyed out otherwise.
@@ -240,6 +243,13 @@ fn create_accelerators() -> windows::core::Result<HACCEL> {
             key(VK_TAB.0, true, ID_PREV_TAB),
             key(VK_NEXT.0, false, ID_NEXT_TAB),
             key(VK_PRIOR.0, false, ID_PREV_TAB),
+            key(VK_OEM_PLUS.0, false, ID_ZOOM_IN), // Ctrl+= (and Ctrl++ with Shift)
+            key(VK_OEM_PLUS.0, true, ID_ZOOM_IN),
+            key(VK_ADD.0, false, ID_ZOOM_IN),
+            key(VK_OEM_MINUS.0, false, ID_ZOOM_OUT),
+            key(VK_SUBTRACT.0, false, ID_ZOOM_OUT),
+            key(b'0' as u16, false, ID_ZOOM_RESET),
+            key(VK_NUMPAD0.0, false, ID_ZOOM_RESET),
         ])
     }
 }
@@ -316,6 +326,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let mut pt = POINT { x: sx, y: sy };
             let _ = ScreenToClient(hwnd, &mut pt);
             perform(hwnd, with_app(|a| a.wheel(pt.x, pt.y, delta)));
+            LRESULT(0)
+        }
+        WM_MOUSEHWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            perform(hwnd, with_app(|a| a.hwheel(delta)));
             LRESULT(0)
         }
         WM_KEYDOWN => {
@@ -564,6 +579,9 @@ fn on_command(hwnd: HWND, id: u16) {
                 error_box(hwnd, &e);
             }
         }
+        ID_ZOOM_IN => perform(hwnd, with_app(|a| a.zoom_step(1))),
+        ID_ZOOM_OUT => perform(hwnd, with_app(|a| a.zoom_step(-1))),
+        ID_ZOOM_RESET => perform(hwnd, with_app(|a| a.zoom_reset())),
         ID_NEXT_TAB | ID_PREV_TAB => {
             with_app(|a| a.cycle_tab(id == ID_NEXT_TAB));
             refresh(hwnd);

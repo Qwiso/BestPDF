@@ -28,7 +28,7 @@ cargo run -- path\to\file.pdf
 
 ## Use
 
-- **Layout (VS Code style, Dark Modern colors):** menu strip · tabs · page view · minimap of the whole file · slim scrollbar · status bar (page N of M, page size)
+- **Layout (VS Code style, Dark Modern colors):** menu strip · tabs · page view · minimap of the whole file · slim scrollbar · status bar (page N of M, zoom, page size)
 - **Tabs:** every file opens in its own tab and keeps its own scroll position. `Ctrl+Tab` / `Ctrl+Shift+Tab` (or `Ctrl+PgDn/PgUp`) to switch, middle-click or × to close. Opening a file that's already open focuses its tab.
 - **Minimap (page strip):** click a page to jump to it; drag the highlighted slider (or between pages) to scrub. Long files scroll the minimap proportionally.
 - **Rearrange pages:** drag a page in the minimap (outside the slider). A blue line shows where it lands.
@@ -45,7 +45,8 @@ cargo run -- path\to\file.pdf
 - **Single window:** launching with files while Best PDF is running opens them as tabs in the existing window. Open dialog and drag-drop accept multiple files.
 - **File menu** (`Alt+F`): New Tab `Ctrl+T` (welcome screen; the next file you open fills it) · New Document `Ctrl+N` (blank Letter page) · Open `Ctrl+O` · Close `Ctrl+W` · Save `Ctrl+S` · Save As `Ctrl+Shift+S` · Print `Ctrl+P`
 - **Open:** also by dragging files in, or passing paths on the command line
-- **Scroll:** wheel, scrollbar, arrows, `PgUp`/`PgDn`/`Space`, `Home`/`End`
+- **Scroll:** wheel, scrollbar, arrows, `PgUp`/`PgDn`/`Space`, `Home`/`End`. Sideways (when zoomed in): `Shift`+wheel, tilt wheel / touchpad, `←`/`→`, or the bar along the bottom.
+- **Zoom:** the widest page fills 75% of the page view by default; zoom from 10% to 250% of the view's width. `Ctrl`+wheel zooms around the pointer; `Ctrl`+`=` / `Ctrl`+`-` step, `Ctrl`+`0` resets. The status bar has − / + and the current zoom (click it to reset). Each tab keeps its own zoom.
 - **Save** writes a temp file and renames it over the original (PDFium reads the source lazily, so writing in place would corrupt it)
 - **Print** is vector output: PDFium draws straight into the printer DC, auto-rotating pages to match paper orientation
 
@@ -72,6 +73,7 @@ Speed choices so far:
 - Page sizes are read without loading pages; only visible pages are rendered.
 - Rendered bitmaps are cached; pages far from the viewport are evicted.
 - During window-edge drags, cached bitmaps are stretched; crisp re-render on release.
+- Zoomed-in pages over 8 MP are rendered only around what's on screen (plus a screenful of slack), not whole.
 - Double-buffered painting, no background erase (no flicker).
 - PDFium loads after the window is shown.
 - Release profile: fat LTO, single codegen unit, `panic = abort`, stripped.

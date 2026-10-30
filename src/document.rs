@@ -23,11 +23,22 @@ pub fn init() -> Result<(), String> {
     pdfium::load(&exe_dir)
 }
 
-/// A rendered page in 32-bit BGRx, top-down, stride = width * 4.
+/// A rendered page, or part of one, in 32-bit BGRx, top-down, stride = width * 4.
 pub struct PageBitmap {
     pub width: i32,
     pub height: i32,
     pub pixels: Vec<u8>,
+    /// Width of the whole page at this scale, and where this bitmap sits in it.
+    pub page_w: i32,
+    pub x0: i32,
+    pub y0: i32,
+}
+
+impl PageBitmap {
+    /// Covers rows/columns [x0, x1) × [y0, y1) of the page at width `page_w`.
+    pub fn covers(&self, page_w: i32, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
+        self.page_w == page_w && self.x0 <= x0 && self.y0 <= y0 && self.x0 + self.width >= x1 && self.y0 + self.height >= y1
+    }
 }
 
 /// What PDFium reads the document from; must outlive the document handle.
@@ -275,11 +286,21 @@ impl Document {
 
     // ---- rendering ---------------------------------------------------------
 
-    /// Renders one page scaled to `width` pixels (height follows aspect ratio).
+    /// Height in pixels of page `index` scaled to `width`.
+    pub fn page_height(&self, index: usize, width: i32) -> i32 {
+        let (pw, ph) = self.page_sizes.get(index).copied().unwrap_or((612.0, 792.0));
+        ((width as f32 * ph / pw).round() as i32).max(1)
+    }
+
+    /// Renders one page scaled to `width` pixels (height follows aspect ratio):
+    /// all of it, or just `region` (x0, y0, x1, y1 in those pixels).
     /// Best PDF stamps on the page are moved into `found` first.
-    pub fn render(&mut self, index: usize, width: i32) -> Result<PageBitmap, String> {
+    pub fn render(&mut self, index: usize, width: i32, region: Option<(i32, i32, i32, i32)>) -> Result<PageBitmap, String> {
         let (pw, ph) = *self.page_sizes.get(index).ok_or_else(|| format!("No page {}", index + 1))?;
-        let (w, h) = (width.max(1), ((width as f32 * ph / pw).round() as i32).max(1));
+        let (page_w, page_h) = (width.max(1), self.page_height(index, width));
+        let (x0, y0, x1, y1) = region.unwrap_or((0, 0, page_w, page_h));
+        let (x0, y0) = (x0.clamp(0, page_w - 1), y0.clamp(0, page_h - 1));
+        let (w, h) = ((x1.min(page_w) - x0).max(1), (y1.min(page_h) - y0).max(1));
         let mut pixels = vec![0u8; w as usize * h as usize * 4];
         let a = api();
         unsafe {
@@ -291,12 +312,12 @@ impl Document {
             let page = (a.FPDF_LoadPage)(self.handle, index as c_int);
             if !page.is_null() {
                 self.found.extend(stamp::take(self.handle, page, index, (pw, ph)));
-                (a.FPDF_RenderPageBitmap)(bitmap, page, 0, 0, w, h, 0, pdfium::FPDF_ANNOT);
+                (a.FPDF_RenderPageBitmap)(bitmap, page, -x0, -y0, page_w, page_h, 0, pdfium::FPDF_ANNOT);
                 (a.FPDF_ClosePage)(page);
             }
             (a.FPDFBitmap_Destroy)(bitmap); // our buffer is not freed
         }
-        Ok(PageBitmap { width: w, height: h, pixels })
+        Ok(PageBitmap { width: w, height: h, pixels, page_w, x0, y0 })
     }
 
     /// Draws a page as vector output into a device context (printing).
