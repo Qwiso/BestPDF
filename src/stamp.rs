@@ -36,7 +36,7 @@ impl PageMap {
         Self { page, w: (pw * K) as c_int, h: (ph * K) as c_int }
     }
 
-    fn to_page(&self, x: f32, y: f32) -> (f64, f64) {
+    pub(crate) fn to_page(&self, x: f32, y: f32) -> (f64, f64) {
         let (mut px, mut py) = (0.0, 0.0);
         unsafe {
             (api().FPDF_DeviceToPage)(self.page, 0, 0, self.w, self.h, 0, (x * K) as c_int, (y * K) as c_int, &mut px, &mut py);
@@ -210,7 +210,7 @@ fn meta(o: &Overlay) -> String {
 }
 
 /// Writes overlays onto a loaded page, as tagged stamps or flattened content.
-pub fn write(doc: FPDF_DOCUMENT, page: FPDF_PAGE, size: (f32, f32), overlays: &[&Overlay], flatten: bool, fonts: &mut Fonts) {
+pub fn write(doc: FPDF_DOCUMENT, page: FPDF_PAGE, size: (f32, f32), overlays: &[&Overlay], flatten: bool, sid: Option<&str>, fonts: &mut Fonts) {
     let a = api();
     let map = PageMap::new(page, size);
     for o in overlays {
@@ -231,7 +231,11 @@ pub fn write(doc: FPDF_DOCUMENT, page: FPDF_PAGE, size: (f32, f32), overlays: &[
                 (a.FPDFAnnot_AppendObject)(annot, obj);
             }
             (a.FPDFAnnot_SetFlags)(annot, pdfium::FPDF_ANNOT_FLAG_PRINT);
-            (a.FPDFAnnot_SetStringValue)(annot, KEY.as_ptr().cast(), wide(&meta(o)).as_ptr());
+            let meta = match sid {
+                Some(sid) => format!("{};sid={sid}", meta(o)),
+                None => meta(o),
+            };
+            (a.FPDFAnnot_SetStringValue)(annot, KEY.as_ptr().cast(), wide(&meta).as_ptr());
             if let Kind::Text { text, .. } = &o.kind {
                 (a.FPDFAnnot_SetStringValue)(annot, CONTENTS.as_ptr().cast(), wide(text).as_ptr());
             }
@@ -255,8 +259,10 @@ fn string_value(annot: pdfium::FPDF_ANNOTATION, key: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&buf))
 }
 
-/// Removes page `index`'s Best PDF stamps from the loaded page and returns them.
-pub fn take(doc: FPDF_DOCUMENT, page: FPDF_PAGE, index: usize, size: (f32, f32)) -> Vec<Overlay> {
+/// Removes page `index`'s Best PDF stamps from the loaded page and returns
+/// them, except those tagged `skip` (written by our own last save), which are
+/// only removed.
+pub fn take(doc: FPDF_DOCUMENT, page: FPDF_PAGE, index: usize, size: (f32, f32), skip: Option<&str>) -> Vec<Overlay> {
     let a = api();
     let map = PageMap::new(page, size);
     let mut found = Vec::new();
@@ -272,6 +278,11 @@ pub fn take(doc: FPDF_DOCUMENT, page: FPDF_PAGE, index: usize, size: (f32, f32))
                 continue;
             };
             let field = |name: &str| meta.split(';').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='));
+            if skip.is_some() && field("sid") == skip {
+                (a.FPDFPage_CloseAnnot)(annot);
+                (a.FPDFPage_RemoveAnnot)(page, i);
+                continue;
+            }
             let mut rect = FS_RECTF::default();
             (a.FPDFAnnot_GetRect)(annot, &mut rect);
             let (x0, y0) = map.to_display(rect.left as f64, rect.top as f64);
@@ -329,6 +340,14 @@ unsafe fn read_image(doc: FPDF_DOCUMENT, page: FPDF_PAGE, annot: pdfium::FPDF_AN
     if bmp.is_null() {
         return None;
     }
+    let (w, h, bgra) = bitmap_bgra(bmp);
+    (a.FPDFBitmap_Destroy)(bmp);
+    Some(Image::new(w, h, bgra))
+}
+
+/// A PDFium bitmap's pixels as straight-alpha BGRA.
+pub(crate) unsafe fn bitmap_bgra(bmp: pdfium::FPDF_BITMAP) -> (i32, i32, Vec<u8>) {
+    let a = api();
     let (w, h, stride) = ((a.FPDFBitmap_GetWidth)(bmp), (a.FPDFBitmap_GetHeight)(bmp), (a.FPDFBitmap_GetStride)(bmp));
     let format = (a.FPDFBitmap_GetFormat)(bmp);
     let src = (a.FPDFBitmap_GetBuffer)(bmp) as *const u8;
@@ -344,6 +363,5 @@ unsafe fn read_image(doc: FPDF_DOCUMENT, page: FPDF_PAGE, annot: pdfium::FPDF_AN
             }
         }
     }
-    (a.FPDFBitmap_Destroy)(bmp);
-    Some(Image::new(w, h, bgra))
+    (w, h, bgra)
 }

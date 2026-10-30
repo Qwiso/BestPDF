@@ -34,6 +34,10 @@ pub const FPDF_FILLMODE_ALTERNATE: c_int = 1;
 pub const FPDF_MATCHCASE: c_ulong = 1;
 /// FPDF_SaveAsCopy: write a complete new file (required after page edits).
 pub const FPDF_NO_INCREMENTAL: u32 = 2;
+/// FPDF_SaveAsCopy: write without encryption (in-memory working copies).
+pub const FPDF_REMOVE_SECURITY: u32 = 4;
+/// FPDF_GetLastError: the document needs a (different) password.
+pub const FPDF_ERR_PASSWORD: c_ulong = 4;
 
 #[repr(C)]
 pub struct FS_SIZEF {
@@ -51,6 +55,7 @@ pub struct FS_RECTF {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct FS_MATRIX {
     pub a: f32,
     pub b: f32,
@@ -149,6 +154,14 @@ pub struct Api {
     pub FPDFText_FindClose: unsafe extern "system" fn(FPDF_SCHHANDLE),
     pub FPDFText_CountRects: unsafe extern "system" fn(FPDF_TEXTPAGE, c_int, c_int) -> c_int,
     pub FPDFText_GetRect: unsafe extern "system" fn(FPDF_TEXTPAGE, c_int, *mut f64, *mut f64, *mut f64, *mut f64) -> FPDF_BOOL,
+    pub FPDFText_GetCharIndexAtPos: unsafe extern "system" fn(FPDF_TEXTPAGE, f64, f64, f64, f64) -> c_int,
+    // page objects, for shrinking images
+    pub FPDFPage_CountObjects: unsafe extern "system" fn(FPDF_PAGE) -> c_int,
+    pub FPDFPage_GetObject: unsafe extern "system" fn(FPDF_PAGE, c_int) -> FPDF_PAGEOBJECT,
+    pub FPDFPageObj_GetBounds: unsafe extern "system" fn(FPDF_PAGEOBJECT, *mut f32, *mut f32, *mut f32, *mut f32) -> FPDF_BOOL,
+    pub FPDFPageObj_GetMatrix: unsafe extern "system" fn(FPDF_PAGEOBJECT, *mut FS_MATRIX) -> FPDF_BOOL,
+    pub FPDFImageObj_GetImageDataRaw: unsafe extern "system" fn(FPDF_PAGEOBJECT, *mut c_void, c_ulong) -> c_ulong,
+    pub FPDFImageObj_LoadJpegFileInline: unsafe extern "system" fn(*mut FPDF_PAGE, c_int, FPDF_PAGEOBJECT, *mut FPDF_FILEACCESS) -> FPDF_BOOL,
 }
 
 static API: OnceLock<Api> = OnceLock::new();
@@ -236,6 +249,13 @@ pub fn load(dir: &Path) -> Result<(), String> {
         FPDFText_FindClose: sym!("FPDFText_FindClose"),
         FPDFText_CountRects: sym!("FPDFText_CountRects"),
         FPDFText_GetRect: sym!("FPDFText_GetRect"),
+        FPDFText_GetCharIndexAtPos: sym!("FPDFText_GetCharIndexAtPos"),
+        FPDFPage_CountObjects: sym!("FPDFPage_CountObjects"),
+        FPDFPage_GetObject: sym!("FPDFPage_GetObject"),
+        FPDFPageObj_GetBounds: sym!("FPDFPageObj_GetBounds"),
+        FPDFPageObj_GetMatrix: sym!("FPDFPageObj_GetMatrix"),
+        FPDFImageObj_GetImageDataRaw: sym!("FPDFImageObj_GetImageDataRaw"),
+        FPDFImageObj_LoadJpegFileInline: sym!("FPDFImageObj_LoadJpegFileInline"),
     };
     unsafe { (api.FPDF_InitLibrary)() };
     let _ = API.set(api);

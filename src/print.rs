@@ -25,13 +25,14 @@ impl Drop for PrintJob {
     }
 }
 
-/// Shows the print dialog. Returns None if the user cancels.
-fn ask(owner: HWND, page_count: usize) -> Option<PrintJob> {
+/// Shows the print dialog: all pages, a range, the page in view (`current`),
+/// or the pages selected in the minimap. Returns None if the user cancels.
+fn ask(owner: HWND, page_count: usize, current: usize, selected: &[usize]) -> Option<PrintJob> {
     let mut ranges = [PRINTPAGERANGE { nFromPage: 1, nToPage: page_count as u32 }; 16];
     let mut dlg = PRINTDLGEXW {
         lStructSize: size_of::<PRINTDLGEXW>() as u32,
         hwndOwner: owner,
-        Flags: PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION | PD_NOCURRENTPAGE,
+        Flags: PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | if selected.is_empty() { PD_NOSELECTION } else { PRINTDLGEX_FLAGS(0) },
         nPageRanges: 1,
         nMaxPageRanges: ranges.len() as u32,
         lpPageRanges: ranges.as_mut_ptr(),
@@ -53,7 +54,11 @@ fn ask(owner: HWND, page_count: usize) -> Option<PrintJob> {
         unsafe { let _ = DeleteDC(dlg.hDC); }
         return None;
     }
-    let ranges = if dlg.Flags.contains(PD_PAGENUMS) {
+    let ranges = if dlg.Flags.contains(PD_CURRENTPAGE) {
+        vec![(current, current)]
+    } else if dlg.Flags.contains(PD_SELECTION) {
+        selected.iter().map(|&p| (p, p)).collect()
+    } else if dlg.Flags.contains(PD_PAGENUMS) {
         ranges[..dlg.nPageRanges as usize]
             .iter()
             .map(|r| {
@@ -68,8 +73,8 @@ fn ask(owner: HWND, page_count: usize) -> Option<PrintJob> {
 }
 
 /// Prints `pdf_bytes`. Returns Ok(false) if the user cancelled.
-pub fn print(owner: HWND, title: &str, pdf_bytes: Vec<u8>, page_count: usize) -> Result<bool, String> {
-    let Some(job) = ask(owner, page_count) else { return Ok(false) };
+pub fn print(owner: HWND, title: &str, pdf_bytes: Vec<u8>, page_count: usize, current: usize, selected: &[usize]) -> Result<bool, String> {
+    let Some(job) = ask(owner, page_count, current, selected) else { return Ok(false) };
     let doc = Document::from_bytes(pdf_bytes)?;
     spool(&job, &doc, title).map(|()| true)
 }

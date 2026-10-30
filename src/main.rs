@@ -4,10 +4,12 @@
 mod dialog;
 mod document;
 mod gdi;
+mod imageio;
 mod overlay;
 mod pdfium;
 mod print;
 mod settings;
+mod sheet;
 mod signature;
 mod signpad;
 mod stamp;
@@ -66,16 +68,31 @@ const ID_FIND_PREV: u16 = 120;
 const ID_ROTATE_CW: u16 = 121;
 const ID_ROTATE_CCW: u16 = 122;
 const ID_DELETE_PAGE: u16 = 123;
+const ID_INSERT_FILE: u16 = 124;
+const ID_COMBINE: u16 = 125;
+const ID_EXTRACT: u16 = 126;
+const ID_SPLIT: u16 = 127;
+const ID_EXPORT_IMAGES: u16 = 128;
+const ID_SHRINK: u16 = 129;
+const ID_GOTO: u16 = 130;
+const ID_FIT_WIDTH: u16 = 131;
+const ID_FIT_PAGE: u16 = 132;
+const ID_TWO_PAGES: u16 = 133;
+const ID_SELECT_PAGES: u16 = 134;
 /// Timer that drives page drags (spring-loaded tabs, auto-scroll).
 const DRAG_TIMER: usize = 1;
 /// Commands that need a document in the active tab; greyed out otherwise.
-const DOC_COMMANDS: [u16; 9] =
-    [ID_SAVE, ID_SAVE_AS, ID_PRINT, ID_FIND, ID_FIND_NEXT, ID_FIND_PREV, ID_ROTATE_CW, ID_ROTATE_CCW, ID_DELETE_PAGE];
+const DOC_COMMANDS: [u16; 22] = [
+    ID_SAVE, ID_SAVE_AS, ID_PRINT, ID_FIND, ID_FIND_NEXT, ID_FIND_PREV, ID_ROTATE_CW, ID_ROTATE_CCW, ID_DELETE_PAGE,
+    ID_INSERT_FILE, ID_EXTRACT, ID_SPLIT, ID_EXPORT_IMAGES, ID_SHRINK, ID_GOTO, ID_FIT_WIDTH, ID_FIT_PAGE, ID_TWO_PAGES,
+    ID_SELECT_PAGES, ID_ZOOM_IN, ID_ZOOM_OUT, ID_ZOOM_RESET,
+];
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static FILE_MENU: Cell<HMENU> = Cell::new(HMENU::default());
     static EDIT_MENU: Cell<HMENU> = Cell::new(HMENU::default());
+    static VIEW_MENU: Cell<HMENU> = Cell::new(HMENU::default());
     static PAGE_MENU: Cell<HMENU> = Cell::new(HMENU::default());
     static TRACKING_LEAVE: Cell<bool> = const { Cell::new(false) };
     static LAST_TITLE: RefCell<String> = const { RefCell::new(String::new()) };
@@ -130,6 +147,7 @@ fn main() -> windows::core::Result<()> {
         style_caption(hwnd);
         FILE_MENU.set(create_file_menu()?);
         EDIT_MENU.set(create_edit_menu()?);
+        VIEW_MENU.set(create_view_menu()?);
         PAGE_MENU.set(create_page_menu()?);
         let accelerators = create_accelerators()?;
 
@@ -221,6 +239,11 @@ fn create_file_menu() -> windows::core::Result<HMENU> {
         AppendMenuW(file, MF_STRING, ID_OPEN as usize, w!("&Open…\tCtrl+O"))?;
         AppendMenuW(file, MF_STRING, ID_CLOSE as usize, w!("&Close Tab\tCtrl+W"))?;
         AppendMenuW(file, MF_SEPARATOR, 0, None)?;
+        AppendMenuW(file, MF_STRING, ID_INSERT_FILE as usize, w!("&Insert Pages from File…"))?;
+        AppendMenuW(file, MF_STRING, ID_COMBINE as usize, w!("Co&mbine Files into New Document…"))?;
+        AppendMenuW(file, MF_STRING, ID_EXTRACT as usize, w!("&Extract Pages…"))?;
+        AppendMenuW(file, MF_STRING, ID_SPLIT as usize, w!("Sp&lit into Files…"))?;
+        AppendMenuW(file, MF_SEPARATOR, 0, None)?;
         AppendMenuW(file, MF_STRING, ID_SAVE as usize, w!("&Save\tCtrl+S"))?;
         AppendMenuW(file, MF_STRING, ID_SAVE_AS as usize, w!("Save &As…\tCtrl+Shift+S"))?;
         let overlays = CreatePopupMenu()?;
@@ -230,6 +253,8 @@ fn create_file_menu() -> windows::core::Result<HMENU> {
         AppendMenuW(file, MF_POPUP, overlays.0 as usize, w!("&When Saving Text && Signatures"))?;
         AppendMenuW(file, MF_SEPARATOR, 0, None)?;
         AppendMenuW(file, MF_STRING, ID_PRINT as usize, w!("&Print…\tCtrl+P"))?;
+        AppendMenuW(file, MF_STRING, ID_EXPORT_IMAGES as usize, w!("Export Pages as &Images…"))?;
+        AppendMenuW(file, MF_STRING, ID_SHRINK as usize, w!("Save &Reduced-Size Copy…"))?;
         AppendMenuW(file, MF_SEPARATOR, 0, None)?;
         AppendMenuW(file, MF_STRING, ID_EXIT as usize, w!("E&xit"))?;
         Ok(file)
@@ -249,7 +274,25 @@ fn create_edit_menu() -> windows::core::Result<HMENU> {
         AppendMenuW(edit, MF_STRING, ID_ROTATE_CW as usize, w!("Rotate Page &Clockwise\tCtrl+R"))?;
         AppendMenuW(edit, MF_STRING, ID_ROTATE_CCW as usize, w!("Rotate Page Counterc&lockwise\tCtrl+Shift+R"))?;
         AppendMenuW(edit, MF_STRING, ID_DELETE_PAGE as usize, w!("&Delete Page"))?;
+        AppendMenuW(edit, MF_STRING, ID_EXTRACT as usize, w!("&Extract Pages…"))?;
+        AppendMenuW(edit, MF_STRING, ID_SELECT_PAGES as usize, w!("Select &All Pages\tCtrl+A"))?;
         Ok(edit)
+    }
+}
+
+fn create_view_menu() -> windows::core::Result<HMENU> {
+    unsafe {
+        let view = CreatePopupMenu()?;
+        AppendMenuW(view, MF_STRING, ID_GOTO as usize, w!("&Go to Page…\tCtrl+G"))?;
+        AppendMenuW(view, MF_SEPARATOR, 0, None)?;
+        AppendMenuW(view, MF_STRING, ID_FIT_WIDTH as usize, w!("Fit &Width\tCtrl+1"))?;
+        AppendMenuW(view, MF_STRING, ID_FIT_PAGE as usize, w!("Fit &Page\tCtrl+2"))?;
+        AppendMenuW(view, MF_STRING, ID_ZOOM_RESET as usize, w!("&Default Zoom (75%)\tCtrl+0"))?;
+        AppendMenuW(view, MF_STRING, ID_ZOOM_IN as usize, w!("Zoom &In\tCtrl+="))?;
+        AppendMenuW(view, MF_STRING, ID_ZOOM_OUT as usize, w!("Zoom &Out\tCtrl+-"))?;
+        AppendMenuW(view, MF_SEPARATOR, 0, None)?;
+        AppendMenuW(view, MF_STRING, ID_TWO_PAGES as usize, w!("&Two Pages Side by Side\tCtrl+3"))?;
+        Ok(view)
     }
 }
 
@@ -261,6 +304,7 @@ fn create_page_menu() -> windows::core::Result<HMENU> {
         AppendMenuW(page, MF_STRING, ID_ROTATE_CCW as usize, w!("Rotate Counterc&lockwise\tCtrl+Shift+R"))?;
         AppendMenuW(page, MF_SEPARATOR, 0, None)?;
         AppendMenuW(page, MF_STRING, ID_DELETE_PAGE as usize, w!("&Delete Page"))?;
+        AppendMenuW(page, MF_STRING, ID_EXTRACT as usize, w!("&Extract Pages…"))?;
         AppendMenuW(page, MF_SEPARATOR, 0, None)?;
         AppendMenuW(page, MF_STRING, ID_UNDO as usize, w!("&Undo\tCtrl+Z"))?;
         AppendMenuW(page, MF_STRING, ID_REDO as usize, w!("&Redo\tCtrl+Y"))?;
@@ -301,6 +345,11 @@ fn create_accelerators() -> windows::core::Result<HACCEL> {
             key(b'F' as u16, false, ID_FIND),
             key(b'R' as u16, false, ID_ROTATE_CW),
             key(b'R' as u16, true, ID_ROTATE_CCW),
+            key(b'G' as u16, false, ID_GOTO),
+            key(b'1' as u16, false, ID_FIT_WIDTH),
+            key(b'2' as u16, false, ID_FIT_PAGE),
+            key(b'3' as u16, false, ID_TWO_PAGES),
+            key(b'A' as u16, false, ID_SELECT_PAGES),
             ACCEL { fVirt: FVIRTKEY, key: VK_F3.0, cmd: ID_FIND_NEXT },
             ACCEL { fVirt: FVIRTKEY | FSHIFT, key: VK_F3.0, cmd: ID_FIND_PREV },
         ])
@@ -342,6 +391,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 TRACKING_LEAVE.set(true);
             }
             let (x, y) = lparam_point(lparam);
+            with_app(|a| a.set_mods(wparam.0 & 0x8 != 0, wparam.0 & 0x4 != 0)); // MK_CONTROL, MK_SHIFT
             perform(hwnd, with_app(|a| a.mouse_move(x, y)));
             LRESULT(0)
         }
@@ -352,6 +402,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_LBUTTONDOWN => {
             let (x, y) = lparam_point(lparam);
+            with_app(|a| a.set_mods(wparam.0 & 0x8 != 0, wparam.0 & 0x4 != 0)); // MK_CONTROL, MK_SHIFT
             perform(hwnd, with_app(|a| a.left_down(x, y)));
             LRESULT(0)
         }
@@ -430,7 +481,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     return LRESULT(0); // cancelled
                 }
             }
+            with_app(|a| a.remember_views());
             let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_SYSCHAR if matches!(wparam.0 as u8, b'v' | b'V') => {
+            if let Some((x, y)) = with_app(|a| a.view_menu_point()) {
+                show_menu(hwnd, VIEW_MENU.get(), x, y);
+            }
             LRESULT(0)
         }
         WM_SYSCHAR if matches!(wparam.0 as u8, b'e' | b'E') => {
@@ -463,6 +521,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 OverlaySave::Flatten => ID_SAVE_FLATTEN,
             };
             let _ = CheckMenuRadioItem(menu, ID_SAVE_ASK as u32, ID_SAVE_FLATTEN as u32, checked as u32, MF_BYCOMMAND.0);
+            let (fit, spread) = with_app(|a| a.view_mode()).flatten().unwrap_or_default();
+            let check = |on: bool| MF_BYCOMMAND.0 | if on { MF_CHECKED.0 } else { MF_UNCHECKED.0 };
+            CheckMenuItem(menu, ID_FIT_WIDTH as u32, check(fit == tab::Fit::Width));
+            CheckMenuItem(menu, ID_FIT_PAGE as u32, check(fit == tab::Fit::Page));
+            CheckMenuItem(menu, ID_TWO_PAGES as u32, check(spread));
             let (undo, redo) = with_app(|a| a.undo_state()).unwrap_or_default();
             let _ = EnableMenuItem(menu, ID_UNDO as u32, state(undo));
             let _ = EnableMenuItem(menu, ID_REDO as u32, state(redo));
@@ -529,9 +592,47 @@ fn perform(hwnd: HWND, action: Option<Action>) {
             }
             Some(Action::FileMenu(x, y)) => return show_file_menu(hwnd, x, y),
             Some(Action::EditMenu(x, y)) => return show_menu(hwnd, EDIT_MENU.get(), x, y),
+            Some(Action::ViewMenu(x, y)) => return show_menu(hwnd, VIEW_MENU.get(), x, y),
+            Some(Action::PickOpen(title)) => {
+                refresh(hwnd);
+                let paths = dialog::pick_pdfs_titled(hwnd, title);
+                return perform(hwnd, with_app(|a| a.job_files(paths)));
+            }
+            Some(Action::PickFolder(title)) => {
+                refresh(hwnd);
+                let folder = dialog::pick_folder(hwnd, title);
+                let cursor = SetCursor(LoadCursorW(None, IDC_WAIT).ok());
+                let next = with_app(|a| a.job_folder(folder));
+                SetCursor(Some(cursor));
+                return perform(hwnd, next);
+            }
+            Some(Action::PickSave(name)) => {
+                refresh(hwnd);
+                let path = dialog::save_pdf(hwnd, &name);
+                let cursor = SetCursor(LoadCursorW(None, IDC_WAIT).ok());
+                let next = with_app(|a| a.job_save(path));
+                SetCursor(Some(cursor));
+                return perform(hwnd, next);
+            }
+            Some(Action::OpenWithPassword(path, password)) => {
+                match Document::open(&path, Some(&password)) {
+                    Ok(doc) => {
+                        with_app(|a| a.add_document(doc));
+                    }
+                    Err(document::OpenError::Password) => {
+                        with_app(|a| a.ask_password(path, true));
+                    }
+                    Err(e) => error_box(hwnd, &e.message(&path)),
+                }
+            }
+            Some(Action::Info(text)) => {
+                refresh(hwnd);
+                MessageBoxW(Some(hwnd), &HSTRING::from(text), w!("Best PDF"), MB_OK | MB_ICONINFORMATION);
+                return;
+            }
             Some(Action::ImportSignature) => {
                 if let Some(path) = dialog::pick_image(hwnd) {
-                    let picture = signature::load_image(&path).and_then(|img| {
+                    let picture = imageio::load(&path).and_then(|img| {
                         signature::prepare_import(&img).ok_or_else(|| format!("{} looks blank.", path.display()))
                     });
                     match picture {
@@ -625,6 +726,7 @@ fn show_page_menu(hwnd: HWND, page: usize, x: i32, y: i32) {
         ID_ROTATE_CW => with_app(|a| a.rotate_page(Some(page), 1)),
         ID_ROTATE_CCW => with_app(|a| a.rotate_page(Some(page), -1)),
         ID_DELETE_PAGE => with_app(|a| a.delete_page(Some(page))),
+        ID_EXTRACT => with_app(|a| a.open_extract(Some(page))),
         ID_UNDO | ID_REDO => with_app(|a| a.undo(id == ID_REDO)),
         _ => None,
     };
@@ -673,6 +775,17 @@ fn on_command(hwnd: HWND, id: u16) {
             }
         }
         ID_UNDO | ID_REDO => perform(hwnd, with_app(|a| a.undo(id == ID_REDO))),
+        ID_INSERT_FILE => perform(hwnd, with_app(|a| a.insert_file())),
+        ID_COMBINE => perform(hwnd, with_app(|a| a.combine_files())),
+        ID_EXTRACT => perform(hwnd, with_app(|a| a.open_extract(None))),
+        ID_SPLIT => perform(hwnd, with_app(|a| a.open_split())),
+        ID_EXPORT_IMAGES => perform(hwnd, with_app(|a| a.open_export_images())),
+        ID_SHRINK => perform(hwnd, with_app(|a| a.open_shrink())),
+        ID_GOTO => perform(hwnd, with_app(|a| a.open_goto())),
+        ID_FIT_WIDTH => perform(hwnd, with_app(|a| a.set_fit(tab::Fit::Width))),
+        ID_FIT_PAGE => perform(hwnd, with_app(|a| a.set_fit(tab::Fit::Page))),
+        ID_TWO_PAGES => perform(hwnd, with_app(|a| a.toggle_spread())),
+        ID_SELECT_PAGES => perform(hwnd, with_app(|a| a.select_all_pages())),
         ID_FIND => perform(hwnd, with_app(|a| a.open_find())),
         ID_FIND_NEXT => perform(hwnd, with_app(|a| a.find_step(1))),
         ID_FIND_PREV => perform(hwnd, with_app(|a| a.find_step(-1))),
@@ -693,15 +806,27 @@ fn on_command(hwnd: HWND, id: u16) {
 
 /// Opens each file in its own tab (or focuses its existing tab).
 fn open_paths(hwnd: HWND, paths: Vec<PathBuf>) {
-    let mut errors = Vec::new();
+    let (mut errors, mut locked) = (Vec::new(), Vec::new());
     for path in paths {
         if with_app(|a| a.focus_path(&path)) == Some(true) {
             continue;
         }
-        match Document::open(&path) {
-            Ok(doc) => { with_app(|a| a.add_document(doc)); }
-            Err(e) => errors.push(e),
+        match Document::open(&path, None) {
+            Ok(doc) => {
+                with_app(|a| a.add_document(doc));
+            }
+            Err(document::OpenError::Password) => locked.push(path),
+            Err(e) => errors.push(e.message(&path)),
         }
+    }
+    // Protected files: ask for the first password; the rest wait to be opened again.
+    let mut locked = locked.into_iter();
+    if let Some(path) = locked.next() {
+        with_app(|a| a.ask_password(path, false));
+    }
+    let others: Vec<String> = locked.map(|p| p.display().to_string()).collect();
+    if !others.is_empty() {
+        errors.push(format!("These are password-protected too; open them one at a time:\n{}", others.join("\n")));
     }
     refresh(hwnd);
     if !errors.is_empty() {
@@ -743,8 +868,11 @@ fn save_to(hwnd: HWND, path: &Path) -> bool {
         a.active_tab_mut().map(|t| {
             let r = t.doc.save_as(path, &t.overlays, flatten);
             if r.is_ok() {
-                t.dirty = false;
-                t.reloaded();
+                if flatten {
+                    t.flattened();
+                } else {
+                    t.mark_saved();
+                }
             }
             r
         })
@@ -803,15 +931,12 @@ fn ask_flatten(hwnd: HWND) -> Option<bool> {
 
 fn print_document(hwnd: HWND) {
     with_app(|a| a.commit_edits());
-    let Some((title, pages, bytes)) =
-        with_app(|a| a.active_tab().map(|t| (t.name(), t.doc.page_count(), t.doc.export(&t.overlays, true)))).flatten()
-    else {
-        return;
-    };
+    let how = document::Export { flatten: true, plain: true, sid: None };
+    let Some((title, pages, bytes, current, selected)) = with_app(|a| a.print_info(&how)).flatten() else { return };
     let result = bytes.and_then(|bytes| {
         // Dialog first (modal, re-enters wnd_proc), then spool with a busy cursor.
         let cursor = unsafe { SetCursor(LoadCursorW(None, IDC_WAIT).ok()) };
-        let r = print::print(hwnd, &title, bytes, pages);
+        let r = print::print(hwnd, &title, bytes, pages, current, &selected);
         unsafe { SetCursor(Some(cursor)); }
         r
     });

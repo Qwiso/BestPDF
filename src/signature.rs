@@ -2,15 +2,12 @@
 //! `signatures` folder (see settings::data_dir), plus turning pen strokes or an
 //! imported picture into a clean transparent image.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
-use windows::core::HSTRING;
-use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::Graphics::Imaging::*;
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
+use crate::imageio;
 use crate::overlay::Image;
 use crate::settings;
 
@@ -83,7 +80,7 @@ impl Library {
                     return None;
                 }
                 let kind = [SigKind::Signature, SigKind::Initials].into_iter().find(|k| name.starts_with(k.prefix()))?;
-                Some(Sig { kind, image: load_image(&path).ok()?, path })
+                Some(Sig { kind, image: imageio::load(&path).ok()?, path })
             })
             .collect();
         Self { items }
@@ -95,7 +92,7 @@ impl Library {
         std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
         let path = dir.join(format!("{}-{stamp}.png", kind.prefix()));
-        save_png(&path, &image).map_err(|e| format!("Could not save {}: {e}", path.display()))?;
+        imageio::save(&path, image.w, image.h, &image.bgra, imageio::Format::Png)?;
         self.items.push(Sig { kind, path, image });
         Ok(self.items.len() - 1)
     }
@@ -106,58 +103,6 @@ impl Library {
         self.items.remove(i);
         Ok(())
     }
-}
-
-// ---- image files (WIC) -----------------------------------------------------
-
-fn factory() -> windows::core::Result<IWICImagingFactory> {
-    unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
-}
-
-/// Any image Windows can decode (PNG, JPEG, BMP, GIF, TIFF, …) as BGRA.
-pub fn load_image(path: &Path) -> Result<Rc<Image>, String> {
-    let fail = |e: windows::core::Error| format!("Could not read {}: {}", path.display(), e.message());
-    unsafe {
-        let wic = factory().map_err(fail)?;
-        let decoder = wic
-            .CreateDecoderFromFilename(&HSTRING::from(path.as_os_str()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
-            .map_err(fail)?;
-        let frame = decoder.GetFrame(0).map_err(fail)?;
-        let converter = wic.CreateFormatConverter().map_err(fail)?;
-        converter
-            .Initialize(&frame, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)
-            .map_err(fail)?;
-        let (mut w, mut h) = (0, 0);
-        converter.GetSize(&mut w, &mut h).map_err(fail)?;
-        if w == 0 || h == 0 || w > 20_000 || h > 20_000 {
-            return Err(format!("{} is too large or empty", path.display()));
-        }
-        let mut bgra = vec![0u8; (w * h * 4) as usize];
-        converter.CopyPixels(std::ptr::null(), w * 4, &mut bgra).map_err(fail)?;
-        Ok(Image::new(w as i32, h as i32, bgra))
-    }
-}
-
-fn save_png(path: &Path, img: &Image) -> Result<(), String> {
-    let fail = |e: windows::core::Error| e.message();
-    unsafe {
-        let wic = factory().map_err(fail)?;
-        let stream = wic.CreateStream().map_err(fail)?;
-        stream.InitializeFromFilename(&HSTRING::from(path.as_os_str()), windows::Win32::Foundation::GENERIC_WRITE.0).map_err(fail)?;
-        let encoder = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()).map_err(fail)?;
-        encoder.Initialize(&stream, WICBitmapEncoderNoCache).map_err(fail)?;
-        let (mut frame, mut props) = (None, None);
-        encoder.CreateNewFrame(&mut frame, &mut props).map_err(fail)?;
-        let frame = frame.ok_or("no frame")?;
-        frame.Initialize(props.as_ref()).map_err(fail)?;
-        frame.SetSize(img.w as u32, img.h as u32).map_err(fail)?;
-        let mut format = GUID_WICPixelFormat32bppBGRA;
-        frame.SetPixelFormat(&mut format).map_err(fail)?;
-        frame.WritePixels(img.h as u32, img.w as u32 * 4, &img.bgra).map_err(fail)?;
-        frame.Commit().map_err(fail)?;
-        encoder.Commit().map_err(fail)?;
-    }
-    Ok(())
 }
 
 // ---- making signature images -----------------------------------------------

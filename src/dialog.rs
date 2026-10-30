@@ -8,7 +8,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem,
-    FOS_ALLOWMULTISELECT, FOS_OVERWRITEPROMPT, SIGDN_FILESYSPATH,
+    FOS_ALLOWMULTISELECT, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
 };
 
 const FILTERS: [COMDLG_FILTERSPEC; 2] = [
@@ -18,10 +18,15 @@ const FILTERS: [COMDLG_FILTERSPEC; 2] = [
 
 /// Shows the Open dialog (multi-select). Empty if the user cancels.
 pub fn pick_pdfs(owner: HWND) -> Vec<PathBuf> {
+    pick_pdfs_titled(owner, "Open PDF")
+}
+
+/// The Open dialog with a title of our own.
+pub fn pick_pdfs_titled(owner: HWND, title: &str) -> Vec<PathBuf> {
     unsafe {
         let pick = || -> Option<Vec<PathBuf>> {
             let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-            dialog.SetTitle(w!("Open PDF")).ok()?;
+            dialog.SetTitle(&HSTRING::from(title)).ok()?;
             dialog.SetOptions(dialog.GetOptions().ok()? | FOS_ALLOWMULTISELECT).ok()?;
             dialog.SetFileTypes(&FILTERS).ok()?;
             dialog.Show(Some(owner)).ok()?; // Err when cancelled
@@ -42,6 +47,17 @@ pub fn pick_image(owner: HWND) -> Option<PathBuf> {
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         dialog.SetTitle(w!("Import Signature Picture")).ok()?;
         dialog.SetFileTypes(&IMAGES).ok()?;
+        dialog.Show(Some(owner)).ok()?; // Err when cancelled
+        path_of(&dialog.GetResult().ok()?)
+    }
+}
+
+/// Shows a folder picker. None if the user cancels.
+pub fn pick_folder(owner: HWND, title: &str) -> Option<PathBuf> {
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog.SetTitle(&HSTRING::from(title)).ok()?;
+        dialog.SetOptions(dialog.GetOptions().ok()? | FOS_PICKFOLDERS).ok()?;
         dialog.Show(Some(owner)).ok()?; // Err when cancelled
         path_of(&dialog.GetResult().ok()?)
     }

@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::tab::{Fit, ViewState};
+
 /// What Save does with overlays.
 #[derive(Clone, Copy, PartialEq)]
 pub enum OverlaySave {
@@ -56,4 +58,58 @@ pub fn set_overlay_save(mode: OverlaySave) -> Result<(), String> {
     let mut lines: Vec<String> = text.lines().filter(|l| !l.trim().starts_with(KEY)).map(String::from).collect();
     lines.push(format!("{KEY} = {value}"));
     std::fs::write(&path, lines.join("\r\n") + "\r\n").map_err(|e| format!("Could not save settings to {}: {e}", path.display()))
+}
+
+// ---- where each file was left ----------------------------------------------
+
+const POSITIONS: &str = "positions.txt";
+/// Files remembered, most recent first.
+const MAX_POSITIONS: usize = 300;
+
+fn fit_key(fit: Fit) -> &'static str {
+    match fit {
+        Fit::Zoom => "zoom",
+        Fit::Width => "width",
+        Fit::Page => "page",
+    }
+}
+
+/// Lines of `page \t frac \t zoom \t fit \t spread \t path`.
+fn read_positions() -> Vec<(PathBuf, ViewState)> {
+    let text = std::fs::read_to_string(data_dir().join(POSITIONS)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.splitn(6, '\t');
+            let page = f.next()?.parse().ok()?;
+            let frac = f.next()?.parse().ok()?;
+            let zoom = f.next()?.parse().ok()?;
+            let fit = match f.next()? {
+                "width" => Fit::Width,
+                "page" => Fit::Page,
+                _ => Fit::Zoom,
+            };
+            let spread = f.next()? == "1";
+            Some((PathBuf::from(f.next()?), ViewState { page, frac, zoom, fit, spread }))
+        })
+        .collect()
+}
+
+/// Where `path` was left last time, if remembered.
+pub fn view_state(path: &Path) -> Option<ViewState> {
+    read_positions().into_iter().find(|(p, _)| p == path).map(|(_, v)| v)
+}
+
+/// Remembers where these files were left.
+pub fn remember_views(views: &[(PathBuf, ViewState)]) {
+    if views.is_empty() {
+        return;
+    }
+    let mut all = views.to_vec();
+    all.extend(read_positions().into_iter().filter(|(p, _)| !views.iter().any(|(q, _)| q == p)));
+    all.truncate(MAX_POSITIONS);
+    let text: String = all
+        .iter()
+        .map(|(p, v)| format!("{}\t{:.4}\t{:.4}\t{}\t{}\t{}\r\n", v.page, v.frac, v.zoom, fit_key(v.fit), v.spread as u8, p.display()))
+        .collect();
+    let _ = std::fs::write(data_dir().join(POSITIONS), text);
 }

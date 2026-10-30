@@ -1,8 +1,9 @@
-//! One open document: its scroll position, page layout and rendered bitmaps.
+//! One open document: its scroll position, page layout and rendered bitmaps,
+//! the overlays placed on it, and its undo history.
 //! Layout is in content pixels from the document's top-left corner; the view
 //! shows the part at (scroll_x, scroll_y).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::document::{Document, PageBitmap};
 use crate::overlay::{Kind, Overlay};
@@ -18,14 +19,19 @@ pub struct PageRect {
 
 #[derive(Default)]
 struct Layout {
-    key: (i32, u32, u32), // (editor width, dpi, zoom bits) it was computed for
+    /// (view width, view height, dpi, zoom bits, fit, spread) it was computed for.
+    key: (i32, i32, u32, u32, Fit, bool),
     pages: Vec<PageRect>,
+    /// Bottom of each page's row (pages side by side can differ in height).
+    row_bottom: Vec<i32>,
     total_h: i32,
     total_w: i32,
+    /// Width of the widest row, and where rows start (centered in total_w).
     max_w: i32,
+    left: i32,
 }
 
-/// Zoom = width of the widest page as a fraction of the page view's width.
+/// Zoom = width of the widest row of pages as a fraction of the page view's width.
 pub const ZOOM_DEFAULT: f32 = 0.75;
 pub const ZOOM_MIN: f32 = 0.10;
 pub const ZOOM_MAX: f32 = 2.50;
@@ -35,23 +41,49 @@ const WHOLE_PAGE_PIXELS: i64 = 8_000_000;
 /// Undo steps kept per tab.
 const UNDO_LIMIT: usize = 200;
 
+/// How the zoom is chosen: set by the user, or kept fitting the view as the
+/// window changes.
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub enum Fit {
+    #[default]
+    Zoom,
+    Width,
+    Page,
+}
+
 /// A change to the page list. Applying one returns the change that undoes
 /// it, so history holds small operations instead of copies of the file.
 pub enum PageOp {
     /// Move page `from` so it ends up at index `to`.
     Move { from: usize, to: usize },
-    /// Insert the only page of `page` at index `at`.
-    Insert { at: usize, page: Document },
-    Delete { at: usize },
+    /// Insert all pages of `pages` at index `at`.
+    Insert { at: usize, pages: Document },
+    /// Delete `count` pages starting at `at`.
+    Delete { at: usize, count: usize },
     /// Quarter turns clockwise (negative: counterclockwise).
     Rotate { page: usize, quarters: i32 },
+    /// Several changes as one step, in order.
+    Batch(Vec<PageOp>),
 }
 
 /// One undo (or redo) step: the overlays to go back to, and the page change
-/// that undoes the page edit, if there was one.
+/// that undoes the page edit, if there was one. `id` names the state the
+/// step leads away from, for telling whether the file is saved.
 struct Step {
+    id: u64,
     overlays: Vec<Overlay>,
     page: Option<PageOp>,
+}
+
+/// Where a file was left: restored when it's opened again.
+#[derive(Clone, Copy)]
+pub struct ViewState {
+    /// Page at the top of the view and how far down it the view starts (0..1).
+    pub page: usize,
+    pub frac: f32,
+    pub zoom: f32,
+    pub fit: Fit,
+    pub spread: bool,
 }
 
 pub struct Tab {
@@ -61,20 +93,31 @@ pub struct Tab {
     pub scroll_y: i32,
     pub scroll_x: i32,
     pub zoom: f32,
-    /// Edited since the last save (shown as ● on the tab).
-    pub dirty: bool,
+    pub fit: Fit,
+    /// Two pages side by side.
+    pub spread: bool,
+    /// Never saved, though made from other pages (counts as unsaved).
+    pub unsaved: bool,
     /// Text, highlights and signatures placed on the pages.
     pub overlays: Vec<Overlay>,
     pub selected: Option<usize>,
     /// While typing into the selected text overlay: caret byte offset.
     pub caret: Option<usize>,
+    /// Pages selected in the minimap, and where a Shift+click range starts.
+    pub page_selection: BTreeSet<usize>,
+    pub selection_anchor: Option<usize>,
     undo: Vec<Step>,
     redo: Vec<Step>,
+    next_id: u64,
+    /// `id` of the top undo step when last saved (None: history was empty).
+    saved_at: Option<u64>,
     /// Overlays as they were when the change in progress (a drag, a typing
     /// session) began; recorded as one undo step when it ends.
     pending: Option<Vec<Overlay>>,
     /// Bumped whenever the pages change (search results go stale).
     pub generation: u64,
+    /// Where to scroll once the layout exists (reopened file).
+    restore: Option<ViewState>,
     layout: Layout,
     pages: HashMap<usize, PageBitmap>,
     thumbs: HashMap<usize, PageBitmap>,
@@ -88,14 +131,21 @@ impl Tab {
             scroll_y: 0,
             scroll_x: 0,
             zoom: ZOOM_DEFAULT,
-            dirty: false,
+            fit: Fit::Zoom,
+            spread: false,
+            unsaved: false,
             overlays: Vec::new(),
             selected: None,
             caret: None,
+            page_selection: BTreeSet::new(),
+            selection_anchor: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            next_id: 1,
+            saved_at: None,
             pending: None,
             generation: 0,
+            restore: None,
             layout: Layout::default(),
             pages: HashMap::new(),
             thumbs: HashMap::new(),
@@ -110,34 +160,65 @@ impl Tab {
         }
     }
 
+    /// Edited since the last save (shown as ● on the tab). Undoing back to
+    /// the saved state counts as clean again.
+    pub fn is_dirty(&self) -> bool {
+        self.unsaved || self.pending.as_ref().is_some_and(|p| *p != self.overlays) || self.undo.last().map(|s| s.id) != self.saved_at
+    }
+
+    /// After a save that kept the overlays editable.
+    pub fn mark_saved(&mut self) {
+        self.unsaved = false;
+        self.saved_at = self.undo.last().map(|s| s.id);
+    }
+
     /// Call after the page list changes: pages are re-laid out and re-rendered.
     pub fn pages_changed(&mut self) {
-        self.dirty = true;
         self.generation += 1;
+        self.page_selection.clear();
+        self.selection_anchor = None;
         self.layout = Layout::default();
         self.pages.clear();
         self.thumbs.clear();
     }
 
-    /// After a save: the file was reloaded, so overlays saved as stamps come
-    /// back from it as pages render again.
-    /// History is dropped too: the reloaded file now holds the overlays, and
-    /// older steps would bring back copies of them.
-    pub fn reloaded(&mut self) {
+    /// After a flattening save: the overlays are now part of the pages, so
+    /// they and the history (which would bring them back) are dropped.
+    pub fn flattened(&mut self) {
         self.overlays.clear();
         self.selected = None;
         self.caret = None;
         self.undo.clear();
         self.redo.clear();
         self.pending = None;
+        self.saved_at = None;
+        self.unsaved = false;
         self.pages.clear();
         self.thumbs.clear();
     }
 
+    // ---- view ------------------------------------------------------------------
+
+    /// Where the view is, for reopening the file later.
+    pub fn view_state(&self) -> ViewState {
+        let pages = &self.layout.pages;
+        let page = pages.iter().position(|p| p.y + p.h > self.scroll_y).unwrap_or(0);
+        let frac = pages.get(page).map_or(0.0, |p| ((self.scroll_y - p.y) as f32 / p.h.max(1) as f32).clamp(0.0, 1.0));
+        ViewState { page, frac, zoom: self.zoom, fit: self.fit, spread: self.spread }
+    }
+
+    /// Returns to a saved view once the layout is ready.
+    pub fn restore_view(&mut self, v: ViewState) {
+        (self.zoom, self.fit, self.spread) = (v.zoom.clamp(ZOOM_MIN, ZOOM_MAX), v.fit, v.spread);
+        self.restore = Some(v);
+    }
+
     // ---- undo ----------------------------------------------------------------
 
-    fn push_undo(&mut self, step: Step) {
-        self.undo.push(step);
+    fn push_undo(&mut self, overlays: Vec<Overlay>, page: Option<PageOp>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.undo.push(Step { id, overlays, page });
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }
@@ -155,8 +236,7 @@ impl Tab {
     pub fn end_change(&mut self) {
         if let Some(before) = self.pending.take() {
             if before != self.overlays {
-                self.dirty = true;
-                self.push_undo(Step { overlays: before, page: None });
+                self.push_undo(before, None);
             }
         }
     }
@@ -169,7 +249,7 @@ impl Tab {
     }
 
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        !self.undo.is_empty() || self.caret.is_some()
     }
 
     pub fn can_redo(&self) -> bool {
@@ -183,94 +263,165 @@ impl Tab {
         let Some(step) = (if redo { self.redo.pop() } else { self.undo.pop() }) else { return Ok(false) };
         let had_page_op = step.page.is_some();
         let back_page = match step.page {
-            Some(op) => match self.apply(op) {
-                Ok(inverse) => Some(inverse),
-                Err(e) => return Err(e),
-            },
+            Some(op) => Some(self.apply(op, false)?),
             None => None,
         };
         let now = std::mem::replace(&mut self.overlays, step.overlays);
-        let back = Step { overlays: now, page: back_page };
+        let back = Step { id: step.id, overlays: now, page: back_page };
         if redo { self.undo.push(back) } else { self.redo.push(back) }
         self.selected = None;
         self.caret = None;
         if had_page_op {
             self.pages_changed();
         }
-        self.dirty = true;
         Ok(true)
     }
 
     // ---- page edits ------------------------------------------------------------
 
-    /// Applies a page change to the document only; returns its inverse.
-    fn apply(&mut self, op: PageOp) -> Result<PageOp, String> {
+    /// Applies a page change to the document, and with `follow`, moves the
+    /// overlays along (undo restores them from its snapshot instead).
+    /// Returns the change that undoes it.
+    fn apply(&mut self, op: PageOp, follow: bool) -> Result<PageOp, String> {
+        let shift = |overlays: &mut Vec<Overlay>, f: &dyn Fn(usize) -> Option<usize>| {
+            overlays.retain_mut(|o| match f(o.page) {
+                Some(p) => {
+                    o.page = p;
+                    true
+                }
+                None => false,
+            })
+        };
         Ok(match op {
             PageOp::Move { from, to } => {
                 self.doc.move_page(from, to)?;
+                if follow {
+                    shift(&mut self.overlays, &|p| {
+                        Some(match p {
+                            _ if p == from => to,
+                            _ if from < to && p > from && p <= to => p - 1,
+                            _ if to < from && p >= to && p < from => p + 1,
+                            _ => p,
+                        })
+                    });
+                }
                 PageOp::Move { from: to, to: from }
             }
-            PageOp::Insert { at, page } => {
-                self.doc.import_page(&page, 0, at)?;
-                PageOp::Delete { at }
+            PageOp::Insert { at, pages } => {
+                let n = pages.page_count();
+                self.doc.import_pages(&pages, None, at)?;
+                if follow {
+                    shift(&mut self.overlays, &|p| Some(if p >= at { p + n } else { p }));
+                }
+                PageOp::Delete { at, count: n }
             }
-            PageOp::Delete { at } => {
-                let page = Document::from_page(&self.doc, at)?;
-                self.doc.delete_page(at);
-                PageOp::Insert { at, page }
+            PageOp::Delete { at, count } => {
+                let pages = Document::from_pages(&self.doc, &(at..at + count).collect::<Vec<_>>())?;
+                self.doc.delete_pages(at, count);
+                if follow {
+                    shift(&mut self.overlays, &|p| match p {
+                        _ if p < at => Some(p),
+                        _ if p < at + count => None,
+                        _ => Some(p - count),
+                    });
+                }
+                PageOp::Insert { at, pages }
             }
             PageOp::Rotate { page, quarters } => {
+                let size = self.doc.page_sizes.get(page).copied().unwrap_or((612.0, 792.0));
                 self.doc.rotate_page(page, quarters)?;
+                if follow {
+                    for o in self.overlays.iter_mut().filter(|o| o.page == page) {
+                        rotate_overlay(o, size, quarters);
+                    }
+                }
                 PageOp::Rotate { page, quarters: -quarters }
+            }
+            PageOp::Batch(ops) => {
+                let mut inverses = Vec::new();
+                for op in ops {
+                    match self.apply(op, follow) {
+                        Ok(inverse) => inverses.push(inverse),
+                        Err(e) => {
+                            // Put back what was done so far.
+                            for inverse in inverses.into_iter().rev() {
+                                let _ = self.apply(inverse, follow);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                inverses.reverse();
+                PageOp::Batch(inverses)
             }
         })
     }
 
     /// Makes a page edit the user asked for: changes the document, carries
-    /// the overlays along, and records it for undo.
+    /// the overlays along, and records it for undo as one step.
     pub fn page_edit(&mut self, op: PageOp) -> Result<(), String> {
         self.end_edit();
         self.end_change();
         let before = self.overlays.clone();
-        let size = match &op {
-            PageOp::Rotate { page, .. } => self.doc.page_sizes.get(*page).copied(),
-            _ => None,
-        };
-        let follow: Box<dyn Fn(&mut Overlay) -> bool> = match &op {
-            &PageOp::Move { from, to } => Box::new(move |o| {
-                o.page = match o.page {
-                    p if p == from => to,
-                    p if from < to && p > from && p <= to => p - 1,
-                    p if to < from && p >= to && p < from => p + 1,
-                    p => p,
-                };
-                true
-            }),
-            &PageOp::Insert { at, .. } => Box::new(move |o| {
-                if o.page >= at {
-                    o.page += 1;
-                }
-                true
-            }),
-            &PageOp::Delete { at } => Box::new(move |o| {
-                if o.page > at {
-                    o.page -= 1;
-                }
-                o.page != at
-            }),
-            &PageOp::Rotate { page, quarters } => Box::new(move |o| {
-                if o.page == page {
-                    rotate_overlay(o, size.unwrap_or((612.0, 792.0)), quarters);
-                }
-                true
-            }),
-        };
-        let inverse = self.apply(op)?;
-        self.overlays.retain_mut(|o| follow(o));
+        let inverse = self.apply(op, true)?;
         self.selected = None;
-        self.push_undo(Step { overlays: before, page: Some(inverse) });
+        self.push_undo(before, Some(inverse));
         self.pages_changed();
         Ok(())
+    }
+
+    /// Moves `pages` (in order) so they sit together before index `at`.
+    pub fn move_pages(&mut self, pages: &[usize], at: usize) -> Result<(), String> {
+        let sel: Vec<usize> = pages.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+        let n = self.doc.page_count();
+        let target = at.min(n) - sel.iter().filter(|&&p| p < at).count();
+        // The order wanted: the other pages, with the moved ones together at `target`.
+        let mut want: Vec<usize> = (0..n).filter(|p| !sel.contains(p)).collect();
+        want.splice(target..target, sel.iter().copied());
+        // Single moves that build it front to back; each fixes one position.
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut ops = Vec::new();
+        for dest in 0..n {
+            if order[dest] != want[dest] {
+                let cur = order.iter().position(|&p| p == want[dest]).unwrap_or(dest);
+                let page = order.remove(cur);
+                order.insert(dest, page);
+                ops.push(PageOp::Move { from: cur, to: dest });
+            }
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.page_edit(PageOp::Batch(ops))
+    }
+
+    /// Deletes `pages` as one step.
+    pub fn delete_pages(&mut self, pages: &[usize]) -> Result<(), String> {
+        // Contiguous runs, last first, so earlier indices stay valid.
+        let sel: Vec<usize> = pages.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for p in sel {
+            match runs.last_mut() {
+                Some((at, count)) if *at + *count == p => *count += 1,
+                _ => runs.push((p, 1)),
+            }
+        }
+        let ops = runs.into_iter().rev().map(|(at, count)| PageOp::Delete { at, count }).collect();
+        self.page_edit(PageOp::Batch(ops))
+    }
+
+    pub fn rotate_pages(&mut self, pages: &[usize], quarters: i32) -> Result<(), String> {
+        let ops = pages.iter().map(|&page| PageOp::Rotate { page, quarters }).collect();
+        self.page_edit(PageOp::Batch(ops))
+    }
+
+    /// The minimap selection, or `fallback` alone when nothing is selected.
+    pub fn selected_pages(&self, fallback: usize) -> Vec<usize> {
+        if self.page_selection.is_empty() {
+            vec![fallback]
+        } else {
+            self.page_selection.iter().copied().collect()
+        }
     }
 
     // ---- overlays ----------------------------------------------------------
@@ -309,7 +460,6 @@ impl Tab {
         let Some(text) = o.text_mut() else { return false };
         if f(text, caret) {
             o.fit_text();
-            self.dirty = true;
         }
         true
     }
@@ -340,34 +490,60 @@ impl Tab {
         self.thumbs.get(&i)
     }
 
-    /// Pages stacked vertically, the widest `zoom` × the view's width, each
-    /// centered. Wider than the view, the document scrolls sideways.
-    pub fn ensure_layout(&mut self, editor_w: i32, m: Metrics) {
-        let key = (editor_w, m.dpi, self.zoom.to_bits());
+    // ---- layout ------------------------------------------------------------------
+
+    /// Pages in rows (one, or two side by side), each row centered. The
+    /// widest row is `zoom` × the view's width, or fits the view (Fit). Wider
+    /// than the view, the document scrolls sideways.
+    pub fn ensure_layout(&mut self, view_w: i32, view_h: i32, m: Metrics) {
+        let key = (view_w, view_h, m.dpi, self.zoom.to_bits(), self.fit, self.spread);
         if self.layout.key == key && !self.layout.pages.is_empty() {
             return;
         }
         let margin = m.px(theme::PAGE_MARGIN);
         let gap = m.px(theme::PAGE_GAP);
-        let widest = self.doc.page_sizes.iter().map(|s| s.0).fold(1.0f32, f32::max);
-        let scale = (editor_w as f32 * self.zoom).max(1.0) / widest;
-        let max_w = ((widest * scale).round() as i32).max(1);
-        let total_w = editor_w.max(max_w + 2 * margin);
+        let per_row = if self.spread { 2 } else { 1 };
+        let sizes = &self.doc.page_sizes;
+        let rows: Vec<std::ops::Range<usize>> = (0..sizes.len()).step_by(per_row).map(|i| i..(i + per_row).min(sizes.len())).collect();
+        // Row sizes in points (the gap between pages is in pixels, added after scaling).
+        let row_w_pt = |r: &std::ops::Range<usize>| sizes[r.clone()].iter().map(|s| s.0).sum::<f32>();
+        let row_h_pt = |r: &std::ops::Range<usize>| sizes[r.clone()].iter().map(|s| s.1).fold(1.0f32, f32::max);
+        let widest = rows.iter().map(row_w_pt).fold(1.0f32, f32::max);
+        let tallest = rows.iter().map(row_h_pt).fold(1.0f32, f32::max);
+        let inner_gap = gap * (per_row as i32 - 1);
+        let fit_w = ((view_w - 2 * margin - inner_gap) as f32).max(10.0) / widest;
+        let scale = match self.fit {
+            Fit::Zoom => (view_w as f32 * self.zoom).max(1.0) / widest,
+            Fit::Width => fit_w,
+            Fit::Page => fit_w.min(((view_h - 2 * margin) as f32).max(10.0) / tallest),
+        };
+        if self.fit != Fit::Zoom {
+            self.zoom = (scale * widest / view_w.max(1) as f32).clamp(ZOOM_MIN, ZOOM_MAX);
+        }
+        let px = |v: f32| (v * scale).round().max(1.0) as i32;
+        let max_w = rows.iter().map(|r| sizes[r.clone()].iter().map(|s| px(s.0)).sum::<i32>() + gap * (r.len() as i32 - 1)).max().unwrap_or(1);
+        let total_w = view_w.max(max_w + 2 * margin);
 
         let mut y = margin;
-        let pages = self
-            .doc
-            .page_sizes
-            .iter()
-            .map(|&(pw, ph)| {
-                let w = (pw * scale).round().max(1.0) as i32;
-                let h = (ph * scale).round().max(1.0) as i32;
-                let r = PageRect { x: (total_w - w) / 2, y, w, h };
-                y += h + gap;
-                r
-            })
-            .collect();
-        self.layout = Layout { key, pages, total_h: y - gap + margin, total_w, max_w };
+        let (mut pages, mut row_bottom) = (Vec::new(), Vec::new());
+        for r in &rows {
+            let row_w = sizes[r.clone()].iter().map(|s| px(s.0)).sum::<i32>() + gap * (r.len() as i32 - 1);
+            let row_h = sizes[r.clone()].iter().map(|s| px(s.1)).max().unwrap_or(1);
+            let mut x = (total_w - row_w) / 2;
+            for &(pw, ph) in &sizes[r.clone()] {
+                pages.push(PageRect { x, y, w: px(pw), h: px(ph) });
+                row_bottom.push(y + row_h);
+                x += px(pw) + gap;
+            }
+            y += row_h + gap;
+        }
+        self.layout = Layout { key, pages, row_bottom, total_h: y - gap + margin, total_w, max_w, left: (total_w - max_w) / 2 };
+
+        if let Some(v) = self.restore.take() {
+            if let Some(p) = self.layout.pages.get(v.page) {
+                self.scroll_y = p.y + (v.frac * p.h as f32) as i32;
+            }
+        }
     }
 
     pub fn pages(&self) -> &[PageRect] {
@@ -378,8 +554,14 @@ impl Tab {
         self.layout.total_h
     }
 
+    /// Width of the widest row of pages.
     pub fn max_page_w(&self) -> i32 {
         self.layout.max_w
+    }
+
+    /// Left edge of the widest row.
+    pub fn content_left(&self) -> i32 {
+        self.layout.left
     }
 
     pub fn content_w(&self) -> i32 {
@@ -413,18 +595,13 @@ impl Tab {
     /// Index of the page under the middle of the viewport.
     pub fn current_page(&self, view_h: i32) -> usize {
         let mid = self.scroll_y + view_h / 2;
-        self.layout
-            .pages
-            .iter()
-            .position(|p| p.y + p.h >= mid)
-            .unwrap_or(self.layout.pages.len().saturating_sub(1))
+        self.layout.row_bottom.iter().position(|&b| b >= mid).unwrap_or(self.layout.pages.len().saturating_sub(1))
     }
 
-    /// Indices of pages intersecting content rows [top, bottom).
+    /// Indices of pages whose rows intersect content rows [top, bottom).
     pub fn pages_in(&self, top: i32, bottom: i32) -> std::ops::Range<usize> {
-        let pages = &self.layout.pages;
-        let first = pages.partition_point(|p| p.y + p.h <= top);
-        let last = pages.partition_point(|p| p.y < bottom);
+        let first = self.layout.row_bottom.partition_point(|&b| b <= top);
+        let last = self.layout.pages.partition_point(|p| p.y < bottom);
         first..last.max(first)
     }
 
@@ -485,7 +662,9 @@ impl Tab {
 /// Moves an overlay with its page turning `quarters` quarter turns clockwise.
 /// `(pw, ph)` is the page's displayed size before turning. Overlays stay
 /// upright; marks turn with the area they cover.
-fn rotate_overlay(o: &mut Overlay, (mut pw, mut ph): (f32, f32), quarters: i32) {
+fn rotate_overlay(o: &mut Overlay, (pw, ph): (f32, f32), quarters: i32) {
+    let mut ph = ph;
+    let mut pw = pw;
     for _ in 0..quarters.rem_euclid(4) {
         let (cx, cy) = (o.x + o.w / 2.0, o.y + o.h / 2.0);
         let (ncx, ncy) = (ph - cy, cx);
@@ -493,7 +672,6 @@ fn rotate_overlay(o: &mut Overlay, (mut pw, mut ph): (f32, f32), quarters: i32) 
             (o.w, o.h) = (o.h, o.w);
         }
         (o.x, o.y) = (ncx - o.w / 2.0, ncy - o.h / 2.0);
-        (pw, ph) = (ph, pw);
+        std::mem::swap(&mut pw, &mut ph);
     }
-    let _ = pw;
 }

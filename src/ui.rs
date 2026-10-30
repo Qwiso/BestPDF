@@ -5,7 +5,7 @@
 //! (menus, dialogs) is returned as an `Action` for main.rs to perform with no
 //! borrow held, since those calls re-enter the window procedure.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,12 @@ use crate::gdi::{self, rect, BackBuffer, Tint};
 use crate::overlay::{self, Family, Image, Kind, Mark, MarkStyle, Overlay, TextStyle};
 use crate::signature::{Library, SigKind};
 use crate::signpad::{PadEvent, SignPad};
-use crate::tab::{PageOp, Tab, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN};
+use crate::sheet::Sheet;
+use crate::tab::{Fit, PageOp, Tab, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN};
+
+#[path = "ui_pages.rs"]
+mod pages;
+use pages::{Job, SheetKind};
 use crate::theme::{self as t, Metrics};
 
 pub enum Action {
@@ -32,6 +37,16 @@ pub enum Action {
     FileMenu(i32, i32),
     /// Show the Edit menu at this client point.
     EditMenu(i32, i32),
+    ViewMenu(i32, i32),
+    /// Ask for PDF files, then call `job_files`.
+    PickOpen(&'static str),
+    /// Ask for a folder, then call `job_folder`.
+    PickFolder(&'static str),
+    /// Ask where to save (suggested name), then call `job_save`.
+    PickSave(String),
+    /// Try opening this file with this password.
+    OpenWithPassword(PathBuf, String),
+    Info(String),
     /// Close this tab, asking first if it has unsaved changes.
     CloseTab(usize),
     /// Pick a picture for the signature being made.
@@ -202,6 +217,7 @@ enum Hit {
     None,
     MenuFile,
     MenuEdit,
+    MenuView,
     Opt(Opt),
     Find(FindHit),
     Tab(usize),
@@ -239,7 +255,7 @@ enum Drag {
     HScroll { grab: i32 },
     /// Pressed on a minimap page; a click jumps there, moving the pointer
     /// starts a page drag.
-    PagePress { page: usize, x: i32, y: i32 },
+    PagePress { page: usize, x: i32, y: i32, ctrl: bool, shift: bool },
     Page(PageDrag),
     /// Moving (grip 0, 0) or resizing an overlay of the active tab. `start` is
     /// where the pointer went down, in page points; `orig` the box and font
@@ -247,6 +263,9 @@ enum Drag {
     Overlay { index: usize, gx: i8, gy: i8, start: (f32, f32), orig: [f32; 4], size: f32 },
     /// Dragging out a new highlight from `anchor` (page points).
     NewHighlight { index: usize, anchor: (f32, f32) },
+    /// Marking text on `page` from `start` (page points): overlays
+    /// `first..first + count` are the marks, one per line, so far.
+    TextMark { page: usize, start: (f32, f32), first: usize, count: usize },
     /// Drawing in the signature pad.
     Pad,
 }
@@ -256,6 +275,8 @@ struct PageDrag {
     /// Source tab and page.
     from: usize,
     page: usize,
+    /// Dragging the source tab's whole page selection (it has `page`).
+    multi: bool,
     /// Pointer, client coordinates.
     x: i32,
     y: i32,
@@ -281,6 +302,7 @@ struct Regions {
     menu: RECT,
     file_button: RECT,
     edit_button: RECT,
+    view_button: RECT,
     tabs: RECT,
     editor: RECT,
     minimap: RECT,
@@ -339,13 +361,22 @@ fn ctrl_down() -> bool {
 
 /// A move may not leave the source document with no pages.
 fn check_can_take(src: &Tab, d: PageDrag) -> Result<(), String> {
-    if !d.copy && src.doc.page_count() <= 1 {
+    if !d.copy && drag_pages(src, d).len() >= src.doc.page_count() {
         return Err(format!(
-            "{} has only one page, so it can't be moved out. Hold Ctrl while dropping to copy it instead.",
+            "That would leave {} with no pages, so they can't be moved out. Hold Ctrl while dropping to copy them instead.",
             src.name()
         ));
     }
     Ok(())
+}
+
+/// The pages a drag carries, in order.
+fn drag_pages(src: &Tab, d: PageDrag) -> Vec<usize> {
+    if d.multi {
+        src.page_selection.iter().copied().collect()
+    } else {
+        vec![d.page]
+    }
 }
 
 /// Minimap geometry for the active tab. `f` maps content px → minimap px.
@@ -378,11 +409,17 @@ pub struct App {
     mouse: (i32, i32),
     /// First half of a UTF-16 surrogate pair typed into a text box.
     surrogate: Option<u16>,
+    /// (Ctrl, Shift) held, from the latest mouse message.
+    mods: (bool, bool),
     /// Styles for new text boxes and marks (the options strip edits these,
     /// and the selected overlay's).
     text_style: TextStyle,
     mark_style: MarkStyle,
     find: Option<Find>,
+    /// A form over everything (Go to Page, Extract, password, …).
+    sheet: Option<(SheetKind, Sheet)>,
+    /// Work waiting for a file or folder from a dialog.
+    job: Option<Job>,
     /// While the user drags the window edge, cached pages are stretched instead
     /// of re-rendered every frame; a crisp render happens when the drag ends.
     pub live_resize: bool,
@@ -409,9 +446,12 @@ impl App {
             library: None,
             mouse: (-1, -1),
             surrogate: None,
+            mods: (false, false),
             text_style: TextStyle::default(),
             mark_style: MarkStyle::default(),
             find: None,
+            sheet: None,
+            job: None,
             live_resize: false,
         }
     }
@@ -469,7 +509,11 @@ impl App {
     }
 
     pub fn add_document(&mut self, doc: Document) {
-        let slot = Slot::Doc(self.make_tab(doc));
+        let mut tab = self.make_tab(doc);
+        if let Some(v) = tab.doc.path.as_deref().and_then(crate::settings::view_state) {
+            tab.restore_view(v);
+        }
+        let slot = Slot::Doc(tab);
         if let Some(welcome @ Slot::Welcome) = self.tabs.get_mut(self.active) {
             *welcome = slot; // a file opened from a welcome tab takes its place
             self.activate(self.active);
@@ -500,7 +544,7 @@ impl App {
     /// Name of tab `i` if it has unsaved changes.
     pub fn unsaved_name(&self, i: usize) -> Option<String> {
         match self.tabs.get(i) {
-            Some(Slot::Doc(tab)) if tab.dirty => Some(tab.name()),
+            Some(Slot::Doc(tab)) if tab.is_dirty() => Some(tab.name()),
             _ => None,
         }
     }
@@ -516,6 +560,11 @@ impl App {
         // Tab indices shift; a page drag in progress would point at the wrong tab.
         if matches!(self.drag, Drag::Page(_) | Drag::PagePress { .. }) {
             self.drag = Drag::None;
+        }
+        if let Some(Slot::Doc(tab)) = self.tabs.get(i) {
+            if let Some(path) = tab.doc.path.clone() {
+                crate::settings::remember_views(&[(path, tab.view_state())]);
+            }
         }
         self.tabs.remove(i);
         if self.tabs.is_empty() {
@@ -554,6 +603,21 @@ impl App {
         (b.left, b.bottom)
     }
 
+    pub fn view_menu_point(&self) -> (i32, i32) {
+        let b = self.regions().view_button;
+        (b.left, b.bottom)
+    }
+
+    /// What printing needs: title, page count, the document with its
+    /// overlays, the page in view, and the minimap selection.
+    pub fn print_info(&mut self, how: &crate::document::Export) -> Option<(String, usize, Result<Vec<u8>, String>, usize, Vec<usize>)> {
+        self.commit_edits();
+        let view_h = self.view_h();
+        let tab = self.active_tab()?;
+        let selected = tab.page_selection.iter().copied().collect();
+        Some((tab.name(), tab.doc.page_count(), tab.doc.export(&tab.overlays, how), tab.current_page(view_h), selected))
+    }
+
     /// (can undo, can redo) in the active tab, for greying out menu items.
     pub fn undo_state(&self) -> (bool, bool) {
         self.active_tab().map_or((false, false), |t| (t.can_undo(), t.can_redo()))
@@ -561,7 +625,7 @@ impl App {
 
     pub fn title(&self) -> String {
         match self.tabs.get(self.active) {
-            Some(Slot::Doc(tab)) if tab.dirty => format!("● {} — Best PDF", tab.name()),
+            Some(Slot::Doc(tab)) if tab.is_dirty() => format!("● {} — Best PDF", tab.name()),
             Some(slot) => format!("{} — Best PDF", slot.name()),
             None => "Best PDF".into(),
         }
@@ -577,6 +641,8 @@ impl App {
         let file_button = rect(m.px(6), m.px(4), label_w, menu.bottom - m.px(8));
         let edit_w = gdi::text_width(self.measure, self.fonts.ui, "Edit") + m.px(16);
         let edit_button = rect(file_button.right + m.px(2), file_button.top, edit_w, file_button.bottom - file_button.top);
+        let view_w = gdi::text_width(self.measure, self.fonts.ui, "View") + m.px(16);
+        let view_button = rect(edit_button.right + m.px(2), file_button.top, view_w, file_button.bottom - file_button.top);
         let tabs_h = if self.has_tabs() { m.px(t::TAB_H) } else { 0 };
         let tabs = rect(0, menu.bottom, w, tabs_h);
         let status = rect(0, h - m.px(t::STATUS_H), w, m.px(t::STATUS_H));
@@ -588,6 +654,7 @@ impl App {
             menu,
             file_button,
             edit_button,
+            view_button,
             tabs,
             editor: rect(0, body_top, (w - sb_w - mm_w).max(0), body_h),
             minimap: rect(w - sb_w - mm_w, body_top, mm_w, body_h),
@@ -679,6 +746,9 @@ impl App {
         if gdi::contains(&r.edit_button, x, y) {
             return Hit::MenuEdit;
         }
+        if gdi::contains(&r.view_button, x, y) {
+            return Hit::MenuView;
+        }
         if let Some(&(o, _)) = self.option_rects().iter().find(|(_, r)| gdi::contains(r, x, y)) {
             return Hit::Opt(o);
         }
@@ -719,7 +789,7 @@ impl App {
 
     /// Tool buttons, right of the File menu.
     fn tool_rects(&self) -> Vec<(ToolButton, RECT)> {
-        let fb = self.regions().edit_button;
+        let fb = self.regions().view_button;
         let mut x = fb.right + self.m.px(14);
         TOOL_BUTTONS
             .iter()
@@ -977,6 +1047,46 @@ impl App {
 
     /// Controls of the options strip, after the tool buttons.
     fn option_rects(&self) -> Vec<(Opt, RECT)> {
+        self.option_layout().0
+    }
+
+    /// The options strip, and the panel behind it when it doesn't fit in the
+    /// menu row and floats over the top-left of the page view instead.
+    fn option_layout(&self) -> (Vec<(Opt, RECT)>, Option<RECT>) {
+        let mut rects = self.option_row();
+        let (Some(first), Some(last)) = (rects.first().map(|r| r.1), rects.last().map(|r| r.1)) else { return (rects, None) };
+        let r = self.regions();
+        if last.right <= r.menu.right - self.m.px(8) {
+            return (rects, None);
+        }
+        // Lay the controls out again over the page view, wrapping onto more
+        // rows (at the gaps between groups when possible) as the width runs out.
+        let pad = self.m.px(6);
+        let (left, top) = (r.editor.left + self.m.px(12) + pad, r.editor.top + self.m.px(10) + pad);
+        let max_right = (r.editor.right - self.m.px(12) - pad).max(left + self.m.px(120));
+        let row_h = first.bottom - first.top;
+        let (mut x, mut y, mut right) = (left, top, left);
+        let mut prev_right = first.left;
+        for (_, b) in &mut rects {
+            let (w, gap) = (b.right - b.left, (b.left - prev_right).max(0));
+            prev_right = b.right;
+            let at = if x == left { x } else { x + gap };
+            let at = if at + w > max_right && x > left {
+                y += row_h + self.m.px(4);
+                left
+            } else {
+                at
+            };
+            *b = RECT { left: at, top: y, right: at + w, bottom: y + row_h };
+            x = at + w;
+            right = right.max(x);
+        }
+        let panel = RECT { left: left - pad, top: top - pad, right: right + pad, bottom: y + row_h + pad };
+        let _ = last;
+        (rects, Some(panel))
+    }
+
+    fn option_row(&self) -> Vec<(Opt, RECT)> {
         let Some(options) = self.options() else { return Vec::new() };
         let Some(&(_, last)) = self.tool_rects().last() else { return Vec::new() };
         let m = self.m;
@@ -1069,8 +1179,7 @@ impl App {
             o.fit_text();
         };
         if tab.caret.is_some() {
-            apply(tab);
-            tab.dirty = true;
+            apply(tab); // part of the typing session's undo step
         } else {
             tab.change(apply);
         }
@@ -1217,29 +1326,25 @@ impl App {
         }
     }
 
-    fn command_page(&self, page: Option<usize>) -> Option<usize> {
-        page.or_else(|| self.active_tab().map(|t| t.current_page(self.view_h())))
-    }
-
-    /// Turns a page (default: the one in view) a quarter turn; `quarters` < 0
-    /// is counterclockwise.
+    /// Turns the selected pages (or `page`, or the one in view) a quarter
+    /// turn; `quarters` < 0 is counterclockwise.
     pub fn rotate_page(&mut self, page: Option<usize>, quarters: i32) -> Action {
-        let Some(page) = self.command_page(page) else { return Action::None };
+        let pages = self.target_pages(page);
         let Some(tab) = self.active_tab_mut() else { return Action::None };
-        match tab.page_edit(PageOp::Rotate { page, quarters }) {
+        match tab.rotate_pages(&pages, quarters) {
             Ok(()) => Action::Redraw,
             Err(e) => Action::Error(e),
         }
     }
 
-    /// Deletes a page (default: the one in view). Undo brings it back.
+    /// Deletes the selected pages (or `page`, or the one in view). Undo brings them back.
     pub fn delete_page(&mut self, page: Option<usize>) -> Action {
-        let Some(page) = self.command_page(page) else { return Action::None };
+        let pages = self.target_pages(page);
         let Some(tab) = self.active_tab_mut() else { return Action::None };
-        if tab.doc.page_count() <= 1 {
-            return Action::Error(format!("{} has only one page, so it can't be deleted.", tab.name()));
+        if pages.len() >= tab.doc.page_count() {
+            return Action::Error(format!("That would leave {} with no pages.", tab.name()));
         }
-        match tab.page_edit(PageOp::Delete { at: page }) {
+        match tab.delete_pages(&pages) {
             Ok(()) => Action::Redraw,
             Err(e) => Action::Error(e),
         }
@@ -1278,8 +1383,9 @@ impl App {
         let p = tab.pages()[i];
         let (fx, fy) = ((cx - p.x) as f32 / p.w as f32, (cy - p.y) as f32 / p.h as f32);
         tab.zoom = zoom;
+        tab.fit = Fit::Zoom;
         let view = (e.right - e.left, e.bottom - e.top);
-        tab.ensure_layout(view.0, m);
+        tab.ensure_layout(view.0, view.1, m);
         let p = tab.pages()[i];
         tab.scroll_x_to(p.x + (fx * p.w as f32).round() as i32 - vx, view.0);
         tab.scroll_to(p.y + (fy * p.h as f32).round() as i32 - vy, view.1);
@@ -1361,7 +1467,7 @@ impl App {
         let editor = self.regions().editor;
         let (m, view_h) = (self.m, editor.bottom - editor.top);
         let tab = self.active_tab_mut()?;
-        tab.ensure_layout(editor.right - editor.left, m);
+        tab.ensure_layout(editor.right - editor.left, view_h, m);
         Some(f(tab, view_h))
     }
 
@@ -1395,7 +1501,8 @@ impl App {
         let p = tab.pages()[i];
         let w = ((p.w as f32) * geo.f).round().max(1.0) as i32;
         let h = ((p.h as f32) * geo.f).round().max(1.0) as i32;
-        let x = mm.left + (mm.right - mm.left - w) / 2;
+        let pad = (mm.right - mm.left - (tab.max_page_w() as f32 * geo.f).round() as i32) / 2;
+        let x = mm.left + pad + ((p.x - tab.content_left()) as f32 * geo.f).round() as i32;
         let y = mm.top + (p.y as f32 * geo.f).round() as i32 - geo.offset;
         rect(x, y, w, h)
     }
@@ -1416,19 +1523,29 @@ impl App {
             .find(|&i| gdi::contains(&self.thumb_rect(tab, &geo, &r.minimap, i), x, y))
     }
 
-    /// Where a page dropped at minimap height `y` goes: before the first page
-    /// whose middle is below the pointer.
-    fn insert_index_at(&self, y: i32) -> Option<usize> {
+    /// Where a page dropped at minimap point (x, y) goes: after every page
+    /// whose middle is above the pointer, or beside it to the left in its row.
+    fn insert_index_at(&self, x: i32, y: i32) -> Option<usize> {
         let r = self.regions();
         let tab = self.active_tab()?;
         let geo = self.mini_geo(tab, &r.minimap, self.view_h());
         let content_y = ((y - r.minimap.top + geo.offset) as f32 / geo.f) as i32;
-        Some(tab.pages().iter().take_while(|p| p.y + p.h / 2 < content_y).count())
+        let thumbs: Vec<RECT> = (0..tab.pages().len()).map(|i| self.thumb_rect(tab, &geo, &r.minimap, i)).collect();
+        let pages = tab.pages();
+        Some(
+            (0..pages.len())
+                .filter(|&i| {
+                    let p = pages[i];
+                    let same_row = content_y >= p.y && content_y < p.y + p.h;
+                    if same_row { (thumbs[i].left + thumbs[i].right) / 2 < x } else { p.y + p.h / 2 < content_y }
+                })
+                .count(),
+        )
     }
 
     fn drop_target(&self, x: i32, y: i32) -> DropTarget {
         match self.hit_test(x, y) {
-            Hit::Minimap => self.insert_index_at(y).map_or(DropTarget::Nothing, DropTarget::Minimap),
+            Hit::Minimap => self.insert_index_at(x, y).map_or(DropTarget::Nothing, DropTarget::Minimap),
             Hit::Tab(i) | Hit::TabClose(i) => DropTarget::Tab(i),
             Hit::TabStrip => DropTarget::NewTab,
             Hit::Editor if self.active_tab().is_none() => DropTarget::Tab(self.active), // welcome screen
@@ -1439,7 +1556,7 @@ impl App {
     fn update_page_drag(&self, d: &mut PageDrag, x: i32, y: i32) {
         d.x = x;
         d.y = y;
-        d.copy = ctrl_down();
+        d.copy = self.mods.0 || ctrl_down();
         d.target = self.drop_target(x, y);
         d.hover_tab = match d.target {
             DropTarget::Tab(i) if i != self.active => match d.hover_tab {
@@ -1491,48 +1608,52 @@ impl App {
         }
     }
 
-    /// Moves (Ctrl: copies) the dragged page into tab `to`, before index `at`.
+    /// Moves (Ctrl: copies) the dragged pages into tab `to`, before index `at`.
     fn transfer(&mut self, d: PageDrag, to: usize, at: usize) -> Result<(), String> {
         if d.from == to {
             let Some(tab) = self.doc_tab_mut(to) else { return Ok(()) };
+            let pages = drag_pages(tab, d);
             if d.copy {
-                let page = Document::from_page(&tab.doc, d.page)?;
-                let copies = tab.overlays_on(d.page);
-                tab.page_edit(PageOp::Insert { at, page })?;
-                tab.add_overlays(copies, at);
-            } else {
-                // `at` counts the page itself, so past it the final index is one less.
-                let (from, dest) = (d.page, if at > d.page { at - 1 } else { at });
-                if dest != from {
-                    tab.page_edit(PageOp::Move { from, to: dest })?;
+                let copies = Document::from_pages(&tab.doc, &pages)?;
+                let overlays: Vec<Vec<Overlay>> = pages.iter().map(|&p| tab.overlays_on(p)).collect();
+                tab.page_edit(PageOp::Insert { at, pages: copies })?;
+                for (k, o) in overlays.into_iter().enumerate() {
+                    tab.add_overlays(o, at + k);
                 }
+            } else {
+                tab.move_pages(&pages, at)?;
             }
             return Ok(());
         }
         let Some((src, dst)) = self.two_doc_tabs(d.from, to) else { return Ok(()) };
         check_can_take(src, d)?;
-        let page = Document::from_page(&src.doc, d.page)?;
-        dst.page_edit(PageOp::Insert { at, page })?;
-        dst.add_overlays(src.overlays_on(d.page), at);
+        let pages = drag_pages(src, d);
+        dst.page_edit(PageOp::Insert { at, pages: Document::from_pages(&src.doc, &pages)? })?;
+        for (k, &p) in pages.iter().enumerate() {
+            dst.add_overlays(src.overlays_on(p), at + k);
+        }
         if !d.copy {
-            src.page_edit(PageOp::Delete { at: d.page })?;
+            src.delete_pages(&pages)?;
         }
         Ok(())
     }
 
-    /// Puts the dragged page in a new untitled document: into welcome tab
+    /// Puts the dragged pages in a new untitled document: into welcome tab
     /// `slot`, or a new tab at the end.
     fn extract(&mut self, d: PageDrag, slot: Option<usize>) -> Result<(), String> {
         let Some(src) = self.doc_tab_mut(d.from) else { return Ok(()) };
         check_can_take(src, d)?;
-        let doc = Document::from_page(&src.doc, d.page)?;
-        let copies = src.overlays_on(d.page);
+        let pages = drag_pages(src, d);
+        let doc = Document::from_pages(&src.doc, &pages)?;
+        let copies: Vec<Vec<Overlay>> = pages.iter().map(|&p| src.overlays_on(p)).collect();
         if !d.copy {
-            src.page_edit(PageOp::Delete { at: d.page })?;
+            src.delete_pages(&pages)?;
         }
         let mut tab = self.make_tab(doc);
-        tab.add_overlays(copies, 0);
-        tab.dirty = true;
+        for (k, o) in copies.into_iter().enumerate() {
+            tab.add_overlays(o, k);
+        }
+        tab.unsaved = true;
         match slot {
             Some(i) => {
                 self.tabs[i] = Slot::Doc(tab);
@@ -1549,6 +1670,10 @@ impl App {
     // ---- input -----------------------------------------------------------
 
     pub fn key(&mut self, key: VIRTUAL_KEY) -> Action {
+        if let Some((_, sheet)) = &mut self.sheet {
+            let event = sheet.key(key);
+            return self.sheet_event(event);
+        }
         if self.pad.is_some() {
             if key == VK_ESCAPE && self.drag == Drag::None {
                 self.pad = None;
@@ -1609,6 +1734,15 @@ impl App {
                 }
             }
         }
+        if key == VK_DELETE && self.active_tab().is_some_and(|t| !t.page_selection.is_empty()) {
+            return self.delete_page(None);
+        }
+        if key == VK_ESCAPE && self.active_tab().is_some_and(|t| !t.page_selection.is_empty()) {
+            if let Some(tab) = self.active_tab_mut() {
+                tab.page_selection.clear();
+            }
+            return Action::Redraw;
+        }
         if key == VK_ESCAPE && self.tool != Tool::Select {
             self.set_tool(Tool::Select);
             return Action::Redraw;
@@ -1663,6 +1797,11 @@ impl App {
 
     /// A typed character (WM_CHAR, UTF-16 unit) for the text box being edited.
     pub fn char_input(&mut self, unit: u16) -> Action {
+        if let Some((_, sheet)) = &mut self.sheet {
+            let Some(c) = char::from_u32(unit as u32) else { return Action::None };
+            let event = sheet.char_input(c);
+            return self.sheet_event(event);
+        }
         if self.pad.is_some() {
             return Action::None;
         }
@@ -1744,6 +1883,9 @@ impl App {
         self.sync_layout();
         let ghost_before = self.stamp_ghost().map(|g| g.1);
         self.mouse = (x, y);
+        if let Some((_, sheet)) = &mut self.sheet {
+            return if sheet.mouse_move(self.m, self.size, x, y) { Action::Redraw } else { Action::None };
+        }
         if let Some(pad) = &mut self.pad {
             return if pad.mouse_move(self.m, self.size, x, y) { Action::Redraw } else { Action::None };
         }
@@ -1779,6 +1921,21 @@ impl App {
                 tab.overlays[index] = o;
                 return Action::Redraw;
             }
+            Drag::TextMark { page, start, first, count } => {
+                let (px, py) = self.to_page_points(page, x, y);
+                let style = self.mark_style;
+                let Some(tab) = self.active_tab_mut() else { return Action::None };
+                let Some(boxes) = tab.doc.text_boxes_between(page, start, (px, py)) else { return Action::None };
+                tab.overlays.truncate(first);
+                for b in &boxes {
+                    // A little taller than the glyph boxes, like a real highlighter.
+                    let pad = b[3] * 0.15;
+                    tab.overlays.push(Overlay { page, x: b[0], y: b[1] - pad, w: b[2], h: b[3] + 2.0 * pad, kind: Kind::Mark(style) });
+                }
+                let n = boxes.len();
+                self.drag = Drag::TextMark { page, start, first, count: n };
+                return if n != count || n > 0 { Action::Redraw } else { Action::None };
+            }
             Drag::NewHighlight { index, anchor } => {
                 let Some(page) = self.active_tab().and_then(|t| t.overlays.get(index)).map(|o| o.page) else { return Action::None };
                 let (px, py) = self.to_page_points(page, x, y);
@@ -1807,13 +1964,15 @@ impl App {
                 let pos = (y - grab - r.scrollbar.top) as i64 * max as i64 / travel.max(1) as i64;
                 return self.scroll_to(pos as i32);
             }
-            Drag::PagePress { page, x: x0, y: y0 } => {
+            Drag::PagePress { page, x: x0, y: y0, .. } => {
                 if (x - x0).abs().max((y - y0).abs()) < self.m.px(5) {
                     return Action::None;
                 }
+                let multi = self.active_tab().is_some_and(|t| t.page_selection.len() > 1 && t.page_selection.contains(&page));
                 let mut d = PageDrag {
                     from: self.active,
                     page,
+                    multi,
                     x,
                     y,
                     copy: false,
@@ -1842,6 +2001,9 @@ impl App {
 
     /// Pointer shape for a client point.
     pub fn cursor(&self, x: i32, y: i32) -> Cursor {
+        if let Some((_, sheet)) = &self.sheet {
+            return if sheet.is_hand(self.m, self.size, x, y) { Cursor::Hand } else { Cursor::Arrow };
+        }
         if let Some(pad) = &self.pad {
             return match pad.hit(self.m, self.size, x, y) {
                 crate::signpad::PadHit::Canvas => Cursor::Cross,
@@ -1868,9 +2030,21 @@ impl App {
             None => match self.tool {
                 Tool::Select => Cursor::Arrow,
                 Tool::Text => Cursor::IBeam,
-                Tool::Highlight | Tool::Stamp(_) => Cursor::Cross,
+                Tool::Highlight => {
+                    // Over text, marks snap to it.
+                    let on_text = self.page_point(x, y).is_some_and(|(page, px, py)| {
+                        self.active_tab().and_then(|t| t.doc.text_boxes_between(page, (px, py), (px, py))).is_some_and(|b| !b.is_empty())
+                    });
+                    if on_text { Cursor::IBeam } else { Cursor::Cross }
+                }
+                Tool::Stamp(_) => Cursor::Cross,
             },
         }
+    }
+
+    /// Ctrl and Shift as the latest mouse message reported them.
+    pub fn set_mods(&mut self, ctrl: bool, shift: bool) {
+        self.mods = (ctrl, shift);
     }
 
     pub fn mouse_leave(&mut self) -> Action {
@@ -1889,6 +2063,10 @@ impl App {
     pub fn left_down(&mut self, x: i32, y: i32) -> Action {
         self.sync_layout();
         self.mouse = (x, y);
+        if let Some((_, sheet)) = &mut self.sheet {
+            let event = sheet.left_down(self.m, self.size, x, y);
+            return self.sheet_event(event);
+        }
         if let Some(pad) = &mut self.pad {
             let event = pad.left_down(self.m, self.size, x, y);
             return self.pad_event(event);
@@ -1909,6 +2087,7 @@ impl App {
             Hit::Opt(o) => self.option_click(o),
             Hit::Find(f) => self.find_click(f),
             Hit::MenuEdit => Action::EditMenu(r.edit_button.left, r.edit_button.bottom),
+            Hit::MenuView => Action::ViewMenu(r.view_button.left, r.view_button.bottom),
             Hit::Editor => self.editor_down(x, y),
             Hit::MenuFile => Action::FileMenu(r.file_button.left, r.file_button.bottom),
             Hit::TabClose(i) => Action::CloseTab(i),
@@ -1920,10 +2099,16 @@ impl App {
             // what's on screen; scrolling is the scrollbar's job.
             Hit::Minimap => match self.page_at(x, y) {
                 Some(page) => {
-                    self.drag = Drag::PagePress { page, x, y };
+                    let (ctrl, shift) = self.mods;
+                    self.drag = Drag::PagePress { page, x, y, ctrl, shift };
                     Action::Capture
                 }
-                None => Action::None,
+                None => {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.page_selection.clear();
+                    }
+                    Action::Redraw
+                }
             },
             Hit::Zoom(ZoomButton::Out) => self.zoom_step(-1),
             Hit::Zoom(ZoomButton::In) => self.zoom_step(1),
@@ -2014,6 +2199,15 @@ impl App {
             }
             Tool::Highlight => {
                 tab.begin_change();
+                // On text, marks follow the lines of text; elsewhere (or with
+                // Alt held) it's a box dragged out by hand.
+                let alt = unsafe { GetKeyState(VK_MENU.0 as i32) < 0 };
+                let on_text = !alt && tab.doc.text_boxes_between(page, (px, py), (px, py)).is_some_and(|b| !b.is_empty());
+                if on_text {
+                    self.drag = Drag::TextMark { page, start: (px, py), first: tab.overlays.len(), count: 0 };
+                    let action = self.mouse_move(x, y);
+                    return if matches!(action, Action::None | Action::Redraw) { Action::Capture } else { action };
+                }
                 tab.overlays.push(Overlay { page, x: px, y: py, w: 0.0, h: 0.0, kind: Kind::Mark(mark_style) });
                 let index = tab.overlays.len() - 1;
                 tab.selected = Some(index);
@@ -2074,6 +2268,13 @@ impl App {
                 }
                 Action::Release(None)
             }
+            Drag::TextMark { .. } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selected = None;
+                    tab.end_change();
+                }
+                Action::Release(None)
+            }
             Drag::NewHighlight { index, .. } => {
                 // A click without a drag doesn't leave a speck behind.
                 if let Some(tab) = self.active_tab_mut() {
@@ -2085,11 +2286,23 @@ impl App {
                 }
                 Action::Release(None)
             }
-            Drag::PagePress { page, .. } => {
-                // A click on a page: bring it to the top of the view.
-                let margin = self.m.px(t::PAGE_MARGIN);
-                if let Some(y) = self.active_tab().and_then(|tab| tab.pages().get(page)).map(|p| p.y) {
-                    self.scroll_to(y - margin);
+            Drag::PagePress { page, ctrl, shift, .. } => {
+                let Some(tab) = self.active_tab_mut() else { return Action::Release(None) };
+                if ctrl {
+                    // Ctrl+click: add or remove the page.
+                    if !tab.page_selection.remove(&page) {
+                        tab.page_selection.insert(page);
+                    }
+                    tab.selection_anchor = Some(page);
+                } else if shift {
+                    // Shift+click: everything from the last clicked page.
+                    let anchor = tab.selection_anchor.unwrap_or(page);
+                    tab.page_selection = (anchor.min(page)..=anchor.max(page)).collect();
+                } else {
+                    // A plain click: jump there.
+                    tab.page_selection.clear();
+                    tab.selection_anchor = Some(page);
+                    self.go_to_page(page);
                 }
                 Action::Release(None)
             }
@@ -2138,7 +2351,7 @@ impl App {
 
     /// Mouse capture was taken away (alt-tab, etc.).
     pub fn capture_lost(&mut self) {
-        if matches!(self.drag, Drag::Overlay { .. } | Drag::NewHighlight { .. }) {
+        if matches!(self.drag, Drag::Overlay { .. } | Drag::NewHighlight { .. } | Drag::TextMark { .. }) {
             if let Some(tab) = self.active_tab_mut() {
                 tab.end_change();
             }
@@ -2190,6 +2403,9 @@ impl App {
         if let Some(pad) = &self.pad {
             pad.paint(dc, self.m, self.size, &self.tint, self.fonts.ui, self.fonts.bold);
         }
+        if let Some((_, sheet)) = &self.sheet {
+            sheet.paint(dc, self.m, self.size, &self.tint, self.fonts.ui, self.fonts.bold, self.fonts.status);
+        }
         unsafe { let _ = BitBlt(screen, 0, 0, w, h, Some(dc), 0, 0, SRCCOPY); }
     }
 
@@ -2211,10 +2427,17 @@ impl App {
             Some(bmp) => gdi::blit(dc, bmp, x, y, w, h),
             None => gdi::fill(dc, &rect(x, y, w, h), t::WHITE),
         }
-        if d.copy {
-            let badge = rect(x - m.px(9), y - m.px(9), m.px(18), m.px(18));
+        let count = if d.multi { src.page_selection.len() } else { 1 };
+        if d.copy || count > 1 {
+            let label = match (d.copy, count) {
+                (true, 1) => "+".to_string(),
+                (true, n) => format!("+{n}"),
+                (false, n) => n.to_string(),
+            };
+            let bw = gdi::text_width(self.measure, self.fonts.status, &label) + m.px(10);
+            let badge = rect(x - m.px(9), y - m.px(9), bw.max(m.px(18)), m.px(18));
             gdi::round_fill(dc, &badge, m.px(18), t::ACCENT);
-            gdi::text(dc, self.fonts.ui, t::TEXT_BRIGHT, "+", badge, DT_CENTER | DT_VCENTER);
+            gdi::text(dc, self.fonts.status, t::TEXT_BRIGHT, &label, badge, DT_CENTER | DT_VCENTER);
         }
     }
 
@@ -2307,16 +2530,30 @@ impl App {
         gdi::fill(dc, &mm, t::EDITOR_BG);
         let visible = self.minimap_pages(tab, &geo, &mm);
         let rects: Vec<RECT> = visible.clone().map(|i| self.thumb_rect(tab, &geo, &mm, i)).collect();
-        // During a page drag: dim the page being moved, and mark where it would land.
-        let (mut dim, mut marker) = (None, None);
+        // Selected pages get a frame. During a page drag: dim the pages being
+        // moved, and mark where they would land.
+        let selected: Vec<RECT> = visible.clone().zip(&rects).filter(|(i, _)| tab.page_selection.contains(i)).map(|(_, r)| *r).collect();
+        let (mut dim, mut marker) = (Vec::new(), None);
         if let Drag::Page(d) = self.drag {
             let here = d.from == self.active;
+            let moving = drag_pages(tab, d);
             if here && !d.copy {
-                dim = visible.clone().position(|i| i == d.page).map(|k| rects[k]);
+                dim = visible.clone().zip(&rects).filter(|(i, _)| moving.contains(i)).map(|(_, r)| *r).collect();
             }
             if let DropTarget::Minimap(at) = d.target {
-                let no_op = here && !d.copy && (at == d.page || at == d.page + 1);
-                if !no_op {
+                let no_op = here && !d.copy && !d.multi && (at == d.page || at == d.page + 1);
+                if !no_op && tab.spread {
+                    // Side by side: a vertical bar before page `at` (or after the last).
+                    let n = tab.pages().len();
+                    let (r, x) = if at < n {
+                        let r = self.thumb_rect(tab, &geo, &mm, at);
+                        (r, r.left - self.m.px(3))
+                    } else {
+                        let r = self.thumb_rect(tab, &geo, &mm, n - 1);
+                        (r, r.right + self.m.px(1))
+                    };
+                    marker = Some(rect(x, r.top, self.m.px(3), r.bottom - r.top));
+                } else if !no_op {
                     // Midway between page `at - 1` and page `at`.
                     let pages = tab.pages();
                     let half_gap = self.m.px(t::PAGE_GAP) / 2;
@@ -2351,8 +2588,13 @@ impl App {
         let pages = tab.pages_in(tab.scroll_y, tab.scroll_y + view_h);
         tab.evict(pages, visible); // both caches, now that both views are drawn
 
-        if let Some(r) = dim {
-            self.tint.fill(dc, &r, t::EDITOR_BG, 0xB0);
+        for r in &dim {
+            self.tint.fill(dc, r, t::EDITOR_BG, 0xB0);
+        }
+        for r in &selected {
+            let f = RECT { left: r.left - 2, top: r.top - 2, right: r.right + 2, bottom: r.bottom + 2 };
+            self.outline(dc, &f, t::ACCENT);
+            self.tint.fill(dc, r, t::ACCENT, 0x30);
         }
         if let Some(r) = marker {
             gdi::fill(dc, &r, t::ACCENT);
@@ -2406,7 +2648,7 @@ impl App {
             gdi::text(dc, self.fonts.ui, color, &self.tabs[i].name(), label, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
             // VS Code: unsaved tabs show ● where the × goes, until hovered.
-            let dirty = matches!(&self.tabs[i], Slot::Doc(tab) if tab.dirty);
+            let dirty = matches!(&self.tabs[i], Slot::Doc(tab) if tab.is_dirty());
             if self.hover == Hit::TabClose(i) {
                 gdi::round_fill(dc, &close, m.px(5), t::HOVER_BG);
             }
@@ -2459,6 +2701,10 @@ impl App {
             gdi::round_fill(dc, &r.edit_button, self.m.px(5), t::HOVER_BG);
         }
         gdi::text(dc, self.fonts.ui, t::TEXT, "Edit", r.edit_button, DT_CENTER | DT_VCENTER);
+        if self.hover == Hit::MenuView {
+            gdi::round_fill(dc, &r.view_button, self.m.px(5), t::HOVER_BG);
+        }
+        gdi::text(dc, self.fonts.ui, t::TEXT, "View", r.view_button, DT_CENTER | DT_VCENTER);
         self.paint_options(dc);
 
         let enabled = self.active_tab().is_some();
@@ -2491,10 +2737,17 @@ impl App {
     fn paint_options(&self, dc: HDC) {
         let Some(options) = self.options() else { return };
         let m = self.m;
-        let rects = self.option_rects();
-        if let Some((_, first)) = rects.first() {
-            let sep = rect(first.left - m.px(11), first.top + m.px(4), 1, first.bottom - first.top - m.px(8));
-            gdi::fill(dc, &sep, t::BORDER);
+        let (rects, panel) = self.option_layout();
+        match (panel, rects.first()) {
+            (Some(p), _) => {
+                gdi::fill(dc, &p, t::BORDER);
+                gdi::fill(dc, &RECT { left: p.left + 1, top: p.top + 1, right: p.right - 1, bottom: p.bottom - 1 }, t::CHROME_BG);
+            }
+            (None, Some((_, first))) => {
+                let sep = rect(first.left - m.px(11), first.top + m.px(4), 1, first.bottom - first.top - m.px(8));
+                gdi::fill(dc, &sep, t::BORDER);
+            }
+            _ => {}
         }
         for &(opt, r) in &rects {
             let hovered = self.hover == Hit::Opt(opt);
@@ -2656,6 +2909,9 @@ impl App {
     /// One line on what the current tool or selection does.
     fn hint(&self) -> Option<&'static str> {
         let tab = self.active_tab()?;
+        if !tab.page_selection.is_empty() {
+            return Some("Drag to move them  ·  Right-click for more  ·  Delete removes  ·  Esc clears");
+        }
         if tab.caret.is_some() {
             return Some("Typing  ·  Enter: new line  ·  Esc or click outside: done");
         }
@@ -2664,7 +2920,7 @@ impl App {
         }
         Some(match self.tool {
             Tool::Text => "Click on a page to add text  ·  Double-click text to edit it  ·  Esc: done",
-            Tool::Highlight => "Drag across a page to mark it  ·  Style and color in the strip above  ·  Esc: done",
+            Tool::Highlight => "Drag across text to mark it (Alt: a free box)  ·  Style and color in the strip  ·  Esc: done",
             Tool::Stamp(_) => "Click to place  ·  Drag to move, corners to resize  ·  Esc: done",
             Tool::Select if tab.selected.is_some() => "Drag to move  ·  Drag handles to resize  ·  Arrows: nudge  ·  Delete: remove",
             Tool::Select => return None,
@@ -2689,6 +2945,11 @@ impl App {
         let view_h = r.editor.bottom - r.editor.top;
         let current = tab.current_page(view_h);
         let mut left = format!("Page {} of {}", current + 1, tab.doc.page_count());
+        match tab.page_selection.len() {
+            0 => {}
+            1 => left.push_str("  ·  1 page selected"),
+            n => left.push_str(&format!("  ·  {n} pages selected")),
+        }
         if let Some(hint) = self.hint() {
             left = format!("{left}      {hint}");
         }
