@@ -188,8 +188,7 @@ const ZOOM_STEPS: [f32; 12] = [0.10, 0.25, 0.33, 0.50, 0.60, 0.75, 0.90, 1.00, 1
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
     None,
-    /// `grab` = pointer offset from the top of the slider/thumb.
-    Minimap { grab: i32 },
+    /// `grab` = pointer offset from the top (left) of the thumb.
     Scrollbar { grab: i32 },
     HScroll { grab: i32 },
     /// Pressed on a minimap page; a click jumps there, moving the pointer
@@ -318,8 +317,6 @@ struct MiniGeo {
     f: f32,
     offset: i32,
     slider: RECT,
-    /// Slider px moved per content px scrolled (inverse used while dragging).
-    k: f32,
 }
 
 pub struct App {
@@ -591,8 +588,7 @@ impl App {
         let offset = if max_scroll > 0 { (tab.scroll_y as i64 * overflow as i64 / max_scroll as i64) as i32 } else { 0 };
         let slider_h = ((view_h as f32 * f).round() as i32).clamp(self.m.px(6), mm_h.max(1));
         let top = mm.top + (tab.scroll_y as f32 * f).round() as i32 - offset;
-        let k = if max_scroll > 0 { f - overflow as f32 / max_scroll as f32 } else { f };
-        MiniGeo { f, offset, slider: RECT { left: mm.left, top, right: mm.right, bottom: top + slider_h }, k: k.max(1e-4) }
+        MiniGeo { f, offset, slider: RECT { left: mm.left, top, right: mm.right, bottom: top + slider_h } }
     }
 
     /// (thumb rect, travel in px) for the scrollbar, or None if nothing to scroll.
@@ -1418,13 +1414,6 @@ impl App {
                 return Action::Redraw;
             }
             Drag::Pad => return Action::None,
-            Drag::Minimap { grab } => {
-                let r = self.regions();
-                let Some(tab) = self.active_tab() else { return Action::None };
-                let k = self.mini_geo(tab, &r.minimap, self.view_h()).k;
-                let slider_top = y - grab - r.minimap.top;
-                return self.scroll_to((slider_top as f32 / k).round() as i32);
-            }
             Drag::HScroll { grab } => {
                 let Some((track, _, travel)) = self.hscroll_thumb() else { return Action::None };
                 let view_w = track.right - track.left;
@@ -1545,29 +1534,15 @@ impl App {
                 self.activate(i);
                 Action::Redraw
             }
-            Hit::Minimap => {
-                let view_h = self.view_h();
-                let Some(tab) = self.active_tab() else { return Action::None };
-                let geo = self.mini_geo(tab, &r.minimap, view_h);
-                let on_slider = gdi::contains(&geo.slider, x, y);
-                // A page outside the slider: click to jump, drag to rearrange.
-                if !on_slider {
-                    if let Some(page) = self.page_at(x, y) {
-                        self.drag = Drag::PagePress { page, x, y };
-                        return Action::Capture;
-                    }
+            // A page: click to jump, drag to rearrange. The slider only marks
+            // what's on screen; scrolling is the scrollbar's job.
+            Hit::Minimap => match self.page_at(x, y) {
+                Some(page) => {
+                    self.drag = Drag::PagePress { page, x, y };
+                    Action::Capture
                 }
-                // On the slider or between pages: scrub like VS Code's minimap.
-                if !on_slider {
-                    // Jump so the clicked spot is centered, then keep dragging from there.
-                    let content_y = ((y - r.minimap.top + geo.offset) as f32 / geo.f) as i32;
-                    self.scroll_to(content_y - view_h / 2);
-                }
-                let Some(tab) = self.active_tab() else { return Action::None };
-                let slider = self.mini_geo(tab, &r.minimap, view_h).slider;
-                self.drag = Drag::Minimap { grab: y - slider.top };
-                Action::Capture
-            }
+                None => Action::None,
+            },
             Hit::Zoom(ZoomButton::Out) => self.zoom_step(-1),
             Hit::Zoom(ZoomButton::In) => self.zoom_step(1),
             Hit::Zoom(ZoomButton::Reset) => self.zoom_reset(),
@@ -1729,7 +1704,7 @@ impl App {
                 Action::Release(None)
             }
             Drag::Page(d) => Action::Release(self.drop_page(d).err()),
-            Drag::Minimap { .. } | Drag::Scrollbar { .. } | Drag::HScroll { .. } => Action::Release(None),
+            Drag::Scrollbar { .. } | Drag::HScroll { .. } => Action::Release(None),
         }
     }
 
@@ -1911,11 +1886,6 @@ impl App {
     fn paint_minimap(&mut self, dc: HDC, r: &Regions) {
         let mm = r.minimap;
         let view_h = r.editor.bottom - r.editor.top;
-        let alpha = match (self.drag, self.hover) {
-            (Drag::Minimap { .. }, _) => t::SLIDER_ALPHA_ACTIVE,
-            (_, Hit::Minimap) => t::SLIDER_ALPHA_HOVER,
-            _ => t::SLIDER_ALPHA,
-        };
         let Some(tab) = self.active_tab() else { return };
         let geo = self.mini_geo(tab, &mm, view_h);
         gdi::fill(dc, &mm, t::EDITOR_BG);
@@ -1972,7 +1942,7 @@ impl App {
             gdi::fill(dc, &r, t::ACCENT);
         }
         if !dragging {
-            self.tint.fill(dc, &geo.slider, t::SLIDER, alpha);
+            self.tint.fill(dc, &geo.slider, t::SLIDER, t::SLIDER_ALPHA);
         }
     }
 
