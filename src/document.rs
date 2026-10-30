@@ -1,5 +1,6 @@
 //! Safe wrapper over PDFium. Everything else in the app talks to this module,
-//! never to pdfium.rs directly, so the engine stays swappable.
+//! never to pdfium.rs directly, so the engine stays swappable. (stamp.rs, which
+//! turns overlays into PDF objects and back, is the one helper it uses.)
 
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::File;
@@ -9,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use windows::Win32::Graphics::Gdi::HDC;
 
+use crate::overlay::Overlay;
 use crate::pdfium::{self, api, FPDF_DOCUMENT, FPDF_FILEACCESS, FPDF_FILEWRITE, FS_SIZEF};
+use crate::stamp;
 
 /// Loads pdfium.dll from next to the executable (portable layout).
 pub fn init() -> Result<(), String> {
@@ -78,6 +81,9 @@ pub struct Document {
     pub page_sizes: Vec<(f32, f32)>,
     /// None for a document that has never been saved.
     pub path: Option<PathBuf>,
+    /// Overlays read out of the file while rendering, waiting for the tab to
+    /// take them. They are removed from the PDF itself as they are read.
+    pub found: Vec<Overlay>,
     _backing: Backing,
 }
 
@@ -139,7 +145,7 @@ impl Document {
     }
 
     fn wrap(handle: FPDF_DOCUMENT, path: Option<PathBuf>, backing: Backing) -> Self {
-        let mut doc = Self { handle, page_sizes: Vec::new(), path, _backing: backing };
+        let mut doc = Self { handle, page_sizes: Vec::new(), path, found: Vec::new(), _backing: backing };
         doc.refresh();
         doc
     }
@@ -210,28 +216,54 @@ impl Document {
         Ok(())
     }
 
-    /// Serialized copy of the current document (used for printing).
-    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+    fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let mut bytes = Vec::new();
         self.write_to(&mut bytes)?;
         Ok(bytes)
     }
 
-    /// Writes the document to `path`, then reloads `self` from there.
+    /// Serialized copy with `overlays` written in: as editable stamps, or
+    /// flattened into the pages. This document itself is left unchanged.
+    pub fn export(&self, overlays: &[Overlay], flatten: bool) -> Result<Vec<u8>, String> {
+        if overlays.is_empty() && !flatten {
+            return self.to_bytes();
+        }
+        let copy = Self::from_bytes(self.to_bytes()?)?;
+        let a = api();
+        let mut fonts = stamp::Fonts::new(copy.handle);
+        for (i, &size) in copy.page_sizes.iter().enumerate() {
+            let mine: Vec<&Overlay> = overlays.iter().filter(|o| o.page == i).collect();
+            // Flattening also covers stamps on pages never shown, still in the file.
+            if mine.is_empty() && !flatten {
+                continue;
+            }
+            unsafe {
+                let page = (a.FPDF_LoadPage)(copy.handle, i as c_int);
+                if page.is_null() {
+                    continue;
+                }
+                let unread = if flatten { stamp::take(copy.handle, page, i, size) } else { Vec::new() };
+                let all: Vec<&Overlay> = unread.iter().chain(mine).collect();
+                stamp::write(copy.handle, page, size, &all, flatten, &mut fonts);
+                (a.FPDF_ClosePage)(page);
+            }
+        }
+        drop(fonts);
+        copy.to_bytes()
+    }
+
+    /// Writes the document with `overlays` to `path`, then reloads `self` from
+    /// there. Overlays saved as stamps come back through `found` as pages render.
     ///
     /// PDFium reads the source file lazily, so writing over it directly would
     /// corrupt the output. We write a sibling temp file and rename it into place;
     /// the old handle keeps reading the old (now unlinked) data until replaced.
-    pub fn save_as(&mut self, path: &Path) -> Result<(), String> {
+    pub fn save_as(&mut self, path: &Path, overlays: &[Overlay], flatten: bool) -> Result<(), String> {
         let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let temp = path.with_file_name(format!(".{file_name}.bestpdf-tmp"));
-        let result = File::create(&temp)
-            .map_err(|e| e.to_string())
-            .and_then(|file| {
-                let mut out = std::io::BufWriter::new(file);
-                self.write_to(&mut out)?;
-                out.flush().map_err(|e| e.to_string())
-            })
+        let result = self
+            .export(overlays, flatten)
+            .and_then(|bytes| std::fs::write(&temp, bytes).map_err(|e| e.to_string()))
             .and_then(|()| std::fs::rename(&temp, path).map_err(|e| e.to_string()));
         if let Err(e) = result {
             let _ = std::fs::remove_file(&temp);
@@ -244,7 +276,8 @@ impl Document {
     // ---- rendering ---------------------------------------------------------
 
     /// Renders one page scaled to `width` pixels (height follows aspect ratio).
-    pub fn render(&self, index: usize, width: i32) -> Result<PageBitmap, String> {
+    /// Best PDF stamps on the page are moved into `found` first.
+    pub fn render(&mut self, index: usize, width: i32) -> Result<PageBitmap, String> {
         let (pw, ph) = *self.page_sizes.get(index).ok_or_else(|| format!("No page {}", index + 1))?;
         let (w, h) = (width.max(1), ((width as f32 * ph / pw).round() as i32).max(1));
         let mut pixels = vec![0u8; w as usize * h as usize * 4];
@@ -257,6 +290,7 @@ impl Document {
             (a.FPDFBitmap_FillRect)(bitmap, 0, 0, w, h, 0xFFFF_FFFF);
             let page = (a.FPDF_LoadPage)(self.handle, index as c_int);
             if !page.is_null() {
+                self.found.extend(stamp::take(self.handle, page, index, (pw, ph)));
                 (a.FPDF_RenderPageBitmap)(bitmap, page, 0, 0, w, h, 0, pdfium::FPDF_ANNOT);
                 (a.FPDF_ClosePage)(page);
             }

@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use crate::document::{Document, PageBitmap};
+use crate::overlay::{Kind, Overlay};
 use crate::theme::{self, Metrics};
 
 #[derive(Clone, Copy)]
@@ -29,6 +30,11 @@ pub struct Tab {
     pub scroll_y: i32,
     /// Edited since the last save (shown as ● on the tab).
     pub dirty: bool,
+    /// Text, highlights and signatures placed on the pages.
+    pub overlays: Vec<Overlay>,
+    pub selected: Option<usize>,
+    /// While typing into the selected text overlay: caret byte offset.
+    pub caret: Option<usize>,
     layout: Layout,
     pages: HashMap<usize, PageBitmap>,
     thumbs: HashMap<usize, PageBitmap>,
@@ -41,6 +47,9 @@ impl Tab {
             untitled,
             scroll_y: 0,
             dirty: false,
+            overlays: Vec::new(),
+            selected: None,
+            caret: None,
             layout: Layout::default(),
             pages: HashMap::new(),
             thumbs: HashMap::new(),
@@ -61,6 +70,77 @@ impl Tab {
         self.layout = Layout::default();
         self.pages.clear();
         self.thumbs.clear();
+    }
+
+    /// After a save: the file was reloaded, so overlays saved as stamps come
+    /// back from it as pages render again.
+    pub fn reloaded(&mut self) {
+        self.overlays.clear();
+        self.selected = None;
+        self.caret = None;
+        self.pages.clear();
+        self.thumbs.clear();
+    }
+
+    // ---- overlays ----------------------------------------------------------
+
+    /// Stops typing; a text box left empty is removed.
+    pub fn end_edit(&mut self) {
+        if self.caret.take().is_none() {
+            return;
+        }
+        let Some(i) = self.selected else { return };
+        if matches!(&self.overlays[i].kind, Kind::Text { text, .. } if text.trim().is_empty()) {
+            self.overlays.remove(i);
+            self.selected = None;
+        }
+    }
+
+    /// Runs `f` on the text being edited and its caret (byte offset). `f`
+    /// returns whether it changed the text; the box is refitted if so.
+    /// Returns false when nothing is being edited.
+    pub fn edit_text(&mut self, f: impl FnOnce(&mut String, &mut usize) -> bool) -> bool {
+        let (Some(caret), Some(i)) = (self.caret.as_mut(), self.selected) else { return false };
+        let Some(o) = self.overlays.get_mut(i) else { return false };
+        let Some(text) = o.text_mut() else { return false };
+        if f(text, caret) {
+            o.fit_text();
+            self.dirty = true;
+        }
+        true
+    }
+
+    pub fn remove_overlay(&mut self, i: usize) {
+        if i < self.overlays.len() {
+            self.overlays.remove(i);
+            self.selected = None;
+            self.caret = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Copies of the overlays on page `page`.
+    pub fn overlays_on(&self, page: usize) -> Vec<Overlay> {
+        self.overlays.iter().filter(|o| o.page == page).cloned().collect()
+    }
+
+    /// Re-indexes overlays after the page list changed: `f` maps an old page
+    /// index to its new one, or None if the page is gone.
+    pub fn remap_overlays(&mut self, f: impl Fn(usize) -> Option<usize>) {
+        self.end_edit();
+        self.selected = None;
+        self.overlays.retain_mut(|o| match f(o.page) {
+            Some(p) => {
+                o.page = p;
+                true
+            }
+            None => false,
+        });
+    }
+
+    /// Adds copies of overlays onto page `page`.
+    pub fn add_overlays(&mut self, copies: Vec<Overlay>, page: usize) {
+        self.overlays.extend(copies.into_iter().map(|o| Overlay { page, ..o }));
     }
 
     /// A thumbnail already rendered (for the drag ghost); never renders.
@@ -142,15 +222,19 @@ impl Tab {
     /// The bitmap for page `i` at width `w`. Renders when missing or stale if
     /// `render` is set; otherwise may return a stale bitmap to stretch.
     pub fn page(&mut self, i: usize, w: i32, render: bool) -> Option<&PageBitmap> {
-        Self::cached(&self.doc, &mut self.pages, i, w, render)
+        let bmp = Self::cached(&mut self.doc, &mut self.pages, i, w, render);
+        self.overlays.append(&mut self.doc.found);
+        bmp
     }
 
     pub fn thumb(&mut self, i: usize, w: i32, render: bool) -> Option<&PageBitmap> {
-        Self::cached(&self.doc, &mut self.thumbs, i, w, render)
+        let bmp = Self::cached(&mut self.doc, &mut self.thumbs, i, w, render);
+        self.overlays.append(&mut self.doc.found);
+        bmp
     }
 
     fn cached<'a>(
-        doc: &Document,
+        doc: &mut Document,
         cache: &'a mut HashMap<usize, PageBitmap>,
         i: usize,
         w: i32,

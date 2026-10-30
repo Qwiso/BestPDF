@@ -58,8 +58,13 @@ impl Tint {
 }
 
 pub fn font(face: &str, logical_size: i32, dpi: u32, weight: i32) -> HFONT {
+    font_px(face, logical_size * dpi as i32 / 96, weight)
+}
+
+/// A font whose em is `px` device pixels tall.
+pub fn font_px(face: &str, px: i32, weight: i32) -> HFONT {
     let mut lf = LOGFONTW {
-        lfHeight: -(logical_size * dpi as i32 / 96),
+        lfHeight: -px,
         lfWeight: weight,
         lfQuality: CLEARTYPE_QUALITY,
         ..Default::default()
@@ -75,6 +80,9 @@ pub fn delete_font(f: HFONT) {
 }
 
 pub fn text(dc: HDC, font: HFONT, color: COLORREF, s: &str, mut r: RECT, flags: DRAW_TEXT_FORMAT) {
+    if s.is_empty() {
+        return; // an empty slice hands Windows a dangling pointer
+    }
     let mut wide: Vec<u16> = s.encode_utf16().collect();
     unsafe {
         let old = SelectObject(dc, font.into());
@@ -86,6 +94,9 @@ pub fn text(dc: HDC, font: HFONT, color: COLORREF, s: &str, mut r: RECT, flags: 
 }
 
 pub fn text_width(dc: HDC, font: HFONT, s: &str) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
     let wide: Vec<u16> = s.encode_utf16().collect();
     let mut size = SIZE::default();
     unsafe {

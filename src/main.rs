@@ -4,8 +4,13 @@
 mod dialog;
 mod document;
 mod gdi;
+mod overlay;
 mod pdfium;
 mod print;
+mod settings;
+mod signature;
+mod signpad;
+mod stamp;
 mod tab;
 mod theme;
 mod ui;
@@ -14,21 +19,22 @@ use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use windows::core::{w, HSTRING, PCSTR};
+use windows::core::{w, BOOL, HSTRING, PCSTR, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use document::Document;
-use ui::{Action, App};
+use settings::OverlaySave;
+use ui::{Action, App, Cursor};
 
 const CLASS: windows::core::PCWSTR = w!("BestPdfWindow");
 /// Icon resource id from assets/app.rc (MAKEINTRESOURCE(1)).
@@ -46,6 +52,9 @@ const ID_EXIT: u16 = 106;
 const ID_NEXT_TAB: u16 = 107;
 const ID_PREV_TAB: u16 = 108;
 const ID_NEW_TAB: u16 = 109;
+const ID_SAVE_ASK: u16 = 110;
+const ID_SAVE_ANNOTATE: u16 = 111;
+const ID_SAVE_FLATTEN: u16 = 112;
 /// Timer that drives page drags (spring-loaded tabs, auto-scroll).
 const DRAG_TIMER: usize = 1;
 /// Commands that need a document in the active tab; greyed out otherwise.
@@ -83,7 +92,7 @@ fn main() -> windows::core::Result<()> {
         };
         RegisterClassExW(&WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance.into(),
             hIcon: icon(SM_CXICON),
@@ -198,6 +207,11 @@ fn create_file_menu() -> windows::core::Result<HMENU> {
         AppendMenuW(file, MF_SEPARATOR, 0, None)?;
         AppendMenuW(file, MF_STRING, ID_SAVE as usize, w!("&Save\tCtrl+S"))?;
         AppendMenuW(file, MF_STRING, ID_SAVE_AS as usize, w!("Save &As…\tCtrl+Shift+S"))?;
+        let overlays = CreatePopupMenu()?;
+        AppendMenuW(overlays, MF_STRING, ID_SAVE_ASK as usize, w!("&Ask Each Time"))?;
+        AppendMenuW(overlays, MF_STRING, ID_SAVE_ANNOTATE as usize, w!("Keep &Editable (Annotations)"))?;
+        AppendMenuW(overlays, MF_STRING, ID_SAVE_FLATTEN as usize, w!("&Flatten into Page"))?;
+        AppendMenuW(file, MF_POPUP, overlays.0 as usize, w!("&When Saving Text && Signatures"))?;
         AppendMenuW(file, MF_SEPARATOR, 0, None)?;
         AppendMenuW(file, MF_STRING, ID_PRINT as usize, w!("&Print…\tCtrl+P"))?;
         AppendMenuW(file, MF_SEPARATOR, 0, None)?;
@@ -278,6 +292,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             perform(hwnd, with_app(|a| a.left_down(x, y)));
             LRESULT(0)
         }
+        WM_LBUTTONDBLCLK => {
+            let (x, y) = lparam_point(lparam);
+            perform(hwnd, with_app(|a| a.double_click(x, y)));
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             perform(hwnd, with_app(|a| a.left_up()));
             LRESULT(0)
@@ -302,6 +321,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_KEYDOWN => {
             perform(hwnd, with_app(|a| a.key(VIRTUAL_KEY(wparam.0 as u16))));
             LRESULT(0)
+        }
+        WM_CHAR => {
+            perform(hwnd, with_app(|a| a.char_input(wparam.0 as u16)));
+            LRESULT(0)
+        }
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = ScreenToClient(hwnd, &mut pt);
+            let id = match with_app(|a| a.cursor(pt.x, pt.y)) {
+                Some(Cursor::Hand) => IDC_HAND,
+                Some(Cursor::Move) => IDC_SIZEALL,
+                Some(Cursor::SizeNWSE) => IDC_SIZENWSE,
+                Some(Cursor::SizeNESW) => IDC_SIZENESW,
+                Some(Cursor::SizeNS) => IDC_SIZENS,
+                Some(Cursor::SizeWE) => IDC_SIZEWE,
+                Some(Cursor::IBeam) => IDC_IBEAM,
+                Some(Cursor::Cross) => IDC_CROSS,
+                Some(Cursor::Arrow) | None => IDC_ARROW,
+            };
+            SetCursor(LoadCursorW(None, id).ok());
+            LRESULT(1)
         }
         WM_TIMER if wparam.0 == DRAG_TIMER => {
             perform(hwnd, with_app(|a| a.tick()));
@@ -335,6 +376,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             for id in DOC_COMMANDS {
                 let _ = EnableMenuItem(menu, id as u32, state(has_doc));
             }
+            let checked = match settings::overlay_save() {
+                OverlaySave::Ask => ID_SAVE_ASK,
+                OverlaySave::Annotate => ID_SAVE_ANNOTATE,
+                OverlaySave::Flatten => ID_SAVE_FLATTEN,
+            };
+            let _ = CheckMenuRadioItem(menu, ID_SAVE_ASK as u32, ID_SAVE_FLATTEN as u32, checked as u32, MF_BYCOMMAND.0);
             LRESULT(0)
         }
         WM_DROPFILES => {
@@ -397,6 +444,31 @@ fn perform(hwnd: HWND, action: Option<Action>) {
                 return;
             }
             Some(Action::FileMenu(x, y)) => return show_file_menu(hwnd, x, y),
+            Some(Action::ImportSignature) => {
+                if let Some(path) = dialog::pick_image(hwnd) {
+                    let picture = signature::load_image(&path).and_then(|img| {
+                        signature::prepare_import(&img).ok_or_else(|| format!("{} looks blank.", path.display()))
+                    });
+                    match picture {
+                        Ok(img) => {
+                            with_app(|a| a.pad_set_image(img));
+                        }
+                        Err(e) => error_box(hwnd, &e),
+                    }
+                }
+            }
+            Some(Action::DeleteSignature(i)) => {
+                let text = w!("Delete this from your saved signatures?\n\nPlaces where it's already been stamped are not affected.");
+                if MessageBoxW(Some(hwnd), text, w!("Best PDF"), MB_OKCANCEL | MB_ICONQUESTION) == IDOK {
+                    if let Some(Err(e)) = with_app(|a| a.delete_signature(i)) {
+                        error_box(hwnd, &e);
+                    }
+                }
+            }
+            Some(Action::Error(e)) => {
+                refresh(hwnd);
+                return error_box(hwnd, &e);
+            }
             Some(Action::CloseTab(i)) => {
                 close_tab(hwnd, i);
                 let mut pt = POINT::default();
@@ -482,6 +554,16 @@ fn on_command(hwnd: HWND, id: u16) {
             prompt_save_as(hwnd);
         }
         ID_PRINT => print_document(hwnd),
+        ID_SAVE_ASK | ID_SAVE_ANNOTATE | ID_SAVE_FLATTEN => {
+            let mode = match id {
+                ID_SAVE_ANNOTATE => OverlaySave::Annotate,
+                ID_SAVE_FLATTEN => OverlaySave::Flatten,
+                _ => OverlaySave::Ask,
+            };
+            if let Err(e) = settings::set_overlay_save(mode) {
+                error_box(hwnd, &e);
+            }
+        }
         ID_NEXT_TAB | ID_PREV_TAB => {
             with_app(|a| a.cycle_tab(id == ID_NEXT_TAB));
             refresh(hwnd);
@@ -528,11 +610,23 @@ fn prompt_save_as(hwnd: HWND) -> bool {
 }
 
 fn save_to(hwnd: HWND, path: &Path) -> bool {
+    with_app(|a| a.commit_edits());
+    let has_overlays = with_app(|a| a.active_tab().is_some_and(|t| !t.overlays.is_empty())).unwrap_or(false);
+    let flatten = match settings::overlay_save() {
+        _ if !has_overlays => false,
+        OverlaySave::Annotate => false,
+        OverlaySave::Flatten => true,
+        OverlaySave::Ask => match ask_flatten(hwnd) {
+            Some(flatten) => flatten,
+            None => return false,
+        },
+    };
     let result = with_app(|a| {
         a.active_tab_mut().map(|t| {
-            let r = t.doc.save_as(path);
+            let r = t.doc.save_as(path, &t.overlays, flatten);
             if r.is_ok() {
                 t.dirty = false;
+                t.reloaded();
             }
             r
         })
@@ -549,9 +643,50 @@ fn save_to(hwnd: HWND, path: &Path) -> bool {
     }
 }
 
+/// Asks how to save text, highlights and signatures. Some(true) = flatten,
+/// None = cancel. "Always do this" updates the setting.
+fn ask_flatten(hwnd: HWND) -> Option<bool> {
+    const ANNOTATE: i32 = 1001;
+    const FLATTEN: i32 = 1002;
+    let annotate_text = HSTRING::from("Keep editable\nSaved as annotations: you can still move, resize or delete them later.");
+    let flatten_text = HSTRING::from("Flatten into the page\nMade part of the page itself, so they can't be changed or removed afterwards.");
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: ANNOTATE, pszButtonText: PCWSTR(annotate_text.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: FLATTEN, pszButtonText: PCWSTR(flatten_text.as_ptr()) },
+    ];
+    let config = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: hwnd,
+        dwFlags: TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        pszWindowTitle: w!("Best PDF"),
+        pszMainInstruction: w!("How should text, highlights and signatures be saved?"),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: ANNOTATE,
+        pszVerificationText: w!("Always do this (you can change it in the File menu)"),
+        ..Default::default()
+    };
+    let (mut button, mut always) = (0, BOOL(0));
+    unsafe { TaskDialogIndirect(&config, Some(&mut button), None, Some(&mut always)) }.ok()?;
+    let flatten = match button {
+        ANNOTATE => false,
+        FLATTEN => true,
+        _ => return None,
+    };
+    if always.as_bool() {
+        let mode = if flatten { OverlaySave::Flatten } else { OverlaySave::Annotate };
+        if let Err(e) = settings::set_overlay_save(mode) {
+            error_box(hwnd, &e);
+        }
+    }
+    Some(flatten)
+}
+
 fn print_document(hwnd: HWND) {
+    with_app(|a| a.commit_edits());
     let Some((title, pages, bytes)) =
-        with_app(|a| a.active_tab().map(|t| (t.name(), t.doc.page_count(), t.doc.to_bytes()))).flatten()
+        with_app(|a| a.active_tab().map(|t| (t.name(), t.doc.page_count(), t.doc.export(&t.overlays, true)))).flatten()
     else {
         return;
     };

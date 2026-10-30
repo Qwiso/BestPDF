@@ -8,9 +8,13 @@ A fast, minimal, portable PDF viewer for Windows. Rust + Win32 + PDFium.
 BestPDF\
   best-pdf.exe
   pdfium.dll
+  settings.ini      (created when you change a setting)
+  signatures\       (your saved signatures and initials, as PNGs)
 ```
 
 No installer, no registry, no runtime. Copy the folder anywhere and run.
+If the folder isn't writable (e.g. under Program Files), settings and
+signatures go to `%APPDATA%\BestPDF` instead.
 
 ## Build
 
@@ -32,6 +36,12 @@ cargo run -- path\to\file.pdf
   - Drop on the empty tab bar (or a welcome tab) to start a new document with that page.
   - Moves by default; hold `Ctrl` to copy. `Esc` cancels. A document's last page can only be copied out.
   - Edited tabs show ●. Closing them, or the window, asks to save first.
+- **Text, highlights, signatures** (tool buttons next to File):
+  - **Text:** click a page and type; `Enter` for a new line, `Esc` or click outside when done. Double-click text to edit it.
+  - **Highlight:** drag across a page.
+  - **Sign ▾:** your saved signatures and initials. **+ New** opens a pad to draw one with the mouse, or import a picture (paper turns transparent and the ink is trimmed). Pick one and it acts as a stamp: every click places a copy. Hover a saved one to delete it.
+  - Anything placed can be dragged and resized with any tool: corners scale text (font size) and signatures (keeping proportions), highlights stretch from any side. Arrows nudge (`Shift`: further), `Delete` removes, `Esc` returns to Select.
+  - **On save** Best PDF asks whether to keep them **editable** (the default: saved as annotations, movable again when reopened, here or in other editors) or **flatten** them into the page. "Always do this", or File › When Saving Text & Signatures, makes the choice stick. Printing always flattens.
 - **Single window:** launching with files while Best PDF is running opens them as tabs in the existing window. Open dialog and drag-drop accept multiple files.
 - **File menu** (`Alt+F`): New Tab `Ctrl+T` (welcome screen; the next file you open fills it) · New Document `Ctrl+N` (blank Letter page) · Open `Ctrl+O` · Close `Ctrl+W` · Save `Ctrl+S` · Save As `Ctrl+Shift+S` · Print `Ctrl+P`
 - **Open:** also by dragging files in, or passing paths on the command line
@@ -45,10 +55,15 @@ cargo run -- path\to\file.pdf
 |---|---|
 | `src/main.rs` | Window, message loop, commands, single-instance hand-off, dark chrome |
 | `src/ui.rs` | Menu strip, tabs, page view, minimap, scrollbar, status bar; input + painting |
-| `src/tab.rs` | One open document: layout (fit-width), scroll, page + thumbnail caches |
+| `src/tab.rs` | One open document: layout (fit-width), scroll, page + thumbnail caches, overlays |
+| `src/overlay.rs` | Text / highlight / signature overlays: model, measuring, on-screen drawing |
+| `src/stamp.rs` | Overlays in the PDF: written as tagged Stamp annotations or flattened content, read back on open |
+| `src/signature.rs` | Signature library (PNG files), image import via WIC, rasterizing drawn strokes |
+| `src/signpad.rs` | The draw-or-import sheet for new signatures |
+| `src/settings.rs` | Settings file and the portable data folder |
 | `src/theme.rs` | Colors and metrics |
 | `src/gdi.rs` | GDI drawing helpers |
-| `src/document.rs` | Safe document API (open, render, move/copy/delete pages, save); the only user of `pdfium.rs` |
+| `src/document.rs` | Safe document API (open, render, move/copy/delete pages, save); with `stamp.rs`, the only user of `pdfium.rs` |
 | `src/pdfium.rs` | Raw PDFium C functions, resolved from `pdfium.dll` at startup |
 | `src/dialog.rs` | Native Open / Save As dialogs |
 | `src/print.rs` | Print dialog + vector printing into the printer DC |
@@ -67,7 +82,7 @@ The app icon lives in `assets/`: `icon-source.webp` is the artwork, and
 Windows SDK, installed with the C++ Build Tools). Re-run the script after
 changing the artwork.
 
-PDFium is called directly (no wrapper crate): `src/pdfium.rs` lists the ~20
+PDFium is called directly (no wrapper crate): `src/pdfium.rs` lists the ~60
 functions used. The DLL version is pinned in `scripts/fetch-pdfium.ps1`; when
 upgrading, check those signatures against the new headers in
 `vendor/pdfium/include`.

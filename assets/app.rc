@@ -1,3 +1,6 @@
 // Resource id 1 is the app icon: Explorer uses the first icon in the exe,
 // and main.rs loads it for the window (title bar, taskbar, Alt+Tab).
 1 ICON "best-pdf.ico"
+
+// Resource id 1 of type 24 (RT_MANIFEST): Common Controls 6 for task dialogs.
+1 24 "app.manifest"

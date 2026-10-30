@@ -32,6 +32,21 @@ pub fn pick_pdfs(owner: HWND) -> Vec<PathBuf> {
     }
 }
 
+/// Shows the Open dialog for one picture (signature import).
+pub fn pick_image(owner: HWND) -> Option<PathBuf> {
+    const IMAGES: [COMDLG_FILTERSPEC; 2] = [
+        COMDLG_FILTERSPEC { pszName: w!("Pictures"), pszSpec: w!("*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ];
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog.SetTitle(w!("Import Signature Picture")).ok()?;
+        dialog.SetFileTypes(&IMAGES).ok()?;
+        dialog.Show(Some(owner)).ok()?; // Err when cancelled
+        path_of(&dialog.GetResult().ok()?)
+    }
+}
+
 /// Shows the Save As dialog, pre-filled with `suggested_name`.
 pub fn save_pdf(owner: HWND, suggested_name: &str) -> Option<PathBuf> {
     unsafe {

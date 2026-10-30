@@ -4,6 +4,7 @@ fn main() {
     // App icon and other Win32 resources (needs rc.exe from the Windows SDK).
     println!("cargo:rerun-if-changed=assets/app.rc");
     println!("cargo:rerun-if-changed=assets/best-pdf.ico");
+    println!("cargo:rerun-if-changed=assets/app.manifest");
     embed_resource::compile("assets/app.rc", embed_resource::NONE)
         .manifest_optional()
         .expect("compile assets/app.rc");
