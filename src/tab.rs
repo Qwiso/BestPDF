@@ -27,6 +27,8 @@ pub struct Tab {
     /// Shown as "Untitled-N" until first saved.
     pub untitled: Option<u32>,
     pub scroll_y: i32,
+    /// Edited since the last save (shown as ● on the tab).
+    pub dirty: bool,
     layout: Layout,
     pages: HashMap<usize, PageBitmap>,
     thumbs: HashMap<usize, PageBitmap>,
@@ -38,6 +40,7 @@ impl Tab {
             doc,
             untitled,
             scroll_y: 0,
+            dirty: false,
             layout: Layout::default(),
             pages: HashMap::new(),
             thumbs: HashMap::new(),
@@ -50,6 +53,19 @@ impl Tab {
             (None, Some(n)) => format!("Untitled-{n}"),
             (None, None) => "Untitled".into(),
         }
+    }
+
+    /// Call after the page list changes: pages are re-laid out and re-rendered.
+    pub fn pages_changed(&mut self) {
+        self.dirty = true;
+        self.layout = Layout::default();
+        self.pages.clear();
+        self.thumbs.clear();
+    }
+
+    /// A thumbnail already rendered (for the drag ghost); never renders.
+    pub fn cached_thumb(&self, i: usize) -> Option<&PageBitmap> {
+        self.thumbs.get(&i)
     }
 
     /// Fit-to-width layout, capped so pages stay readable on wide monitors.

@@ -6,6 +6,7 @@
 //! borrow held, since those calls re-enter the window procedure.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::*;
@@ -21,11 +22,16 @@ pub enum Action {
     Redraw,
     /// Redraw and start capturing the mouse (a drag began).
     Capture,
-    /// Redraw and release the mouse capture (a drag ended).
-    Release,
+    /// Redraw and release the mouse capture (a drag ended), reporting any error.
+    Release(Option<String>),
     /// Show the File menu at this client point.
     FileMenu(i32, i32),
+    /// Close this tab, asking first if it has unsaved changes.
+    CloseTab(usize),
 }
+
+/// How long the pointer must rest on a tab during a page drag to switch to it.
+const SPRING_LOAD: Duration = Duration::from_millis(450);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Hit {
@@ -45,6 +51,36 @@ enum Drag {
     /// `grab` = pointer offset from the top of the slider/thumb.
     Minimap { grab: i32 },
     Scrollbar { grab: i32 },
+    /// Pressed on a minimap page; a click jumps there, moving the pointer
+    /// starts a page drag.
+    PagePress { page: usize, x: i32, y: i32 },
+    Page(PageDrag),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct PageDrag {
+    /// Source tab and page.
+    from: usize,
+    page: usize,
+    /// Pointer, client coordinates.
+    x: i32,
+    y: i32,
+    /// Ctrl held: copy instead of move.
+    copy: bool,
+    target: DropTarget,
+    /// Tab under the pointer and since when (switches to it after SPRING_LOAD).
+    hover_tab: Option<(usize, Instant)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DropTarget {
+    Nothing,
+    /// Insert before this page index in the active tab (== page count: at end).
+    Minimap(usize),
+    /// Append to this tab's document (a welcome tab becomes a new document).
+    Tab(usize),
+    /// Empty tab strip: a new document tab.
+    NewTab,
 }
 
 struct Regions {
@@ -98,6 +134,21 @@ impl Slot {
             Slot::Doc(tab) => tab.name(),
         }
     }
+}
+
+fn ctrl_down() -> bool {
+    unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
+}
+
+/// A move may not leave the source document with no pages.
+fn check_can_take(src: &Tab, d: PageDrag) -> Result<(), String> {
+    if !d.copy && src.doc.page_count() <= 1 {
+        return Err(format!(
+            "{} has only one page, so it can't be moved out. Hold Ctrl while dropping to copy it instead.",
+            src.name()
+        ));
+    }
+    Ok(())
 }
 
 /// Minimap geometry for the active tab. `f` maps content px → minimap px.
@@ -190,12 +241,16 @@ impl App {
         }
     }
 
-    pub fn add_document(&mut self, doc: Document) {
+    fn make_tab(&mut self, doc: Document) -> Tab {
         let untitled = doc.path.is_none().then(|| {
             self.next_untitled += 1;
             self.next_untitled - 1
         });
-        let slot = Slot::Doc(Tab::new(doc, untitled));
+        Tab::new(doc, untitled)
+    }
+
+    pub fn add_document(&mut self, doc: Document) {
+        let slot = Slot::Doc(self.make_tab(doc));
         if let Some(welcome @ Slot::Welcome) = self.tabs.get_mut(self.active) {
             *welcome = slot; // a file opened from a welcome tab takes its place
             self.activate(self.active);
@@ -215,14 +270,30 @@ impl App {
         self.activate(at);
     }
 
-    fn activate(&mut self, i: usize) {
+    pub fn activate(&mut self, i: usize) {
         self.active = i.min(self.tabs.len().saturating_sub(1));
         self.reveal_active_tab();
+    }
+
+    /// Name of tab `i` if it has unsaved changes.
+    pub fn unsaved_name(&self, i: usize) -> Option<String> {
+        match self.tabs.get(i) {
+            Some(Slot::Doc(tab)) if tab.dirty => Some(tab.name()),
+            _ => None,
+        }
+    }
+
+    pub fn first_unsaved(&self) -> Option<usize> {
+        (0..self.tabs.len()).find(|&i| self.unsaved_name(i).is_some())
     }
 
     pub fn close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
+        }
+        // Tab indices shift; a page drag in progress would point at the wrong tab.
+        if matches!(self.drag, Drag::Page(_) | Drag::PagePress { .. }) {
+            self.drag = Drag::None;
         }
         self.tabs.remove(i);
         if self.tabs.is_empty() {
@@ -238,8 +309,8 @@ impl App {
         self.reveal_active_tab();
     }
 
-    pub fn close_active(&mut self) {
-        self.close_tab(self.active);
+    pub fn active_index(&self) -> usize {
+        self.active
     }
 
     pub fn cycle_tab(&mut self, forward: bool) {
@@ -257,6 +328,7 @@ impl App {
 
     pub fn title(&self) -> String {
         match self.tabs.get(self.active) {
+            Some(Slot::Doc(tab)) if tab.dirty => format!("● {} — Best PDF", tab.name()),
             Some(slot) => format!("{} — Best PDF", slot.name()),
             None => "Best PDF".into(),
         }
@@ -406,14 +478,180 @@ impl App {
         self.scroll_to(y.saturating_add(dy))
     }
 
+    /// Brings the active tab's layout up to date. Layout is otherwise rebuilt
+    /// at paint time, and input can arrive between a page edit and the repaint.
+    fn sync_layout(&mut self) {
+        self.with_view(|_, _| ());
+    }
+
     fn view_h(&self) -> i32 {
         let e = self.regions().editor;
         e.bottom - e.top
     }
 
+    // ---- pages in the minimap -------------------------------------------
+
+    /// Minimap rect of page `i` of `tab`.
+    fn thumb_rect(&self, tab: &Tab, geo: &MiniGeo, mm: &RECT, i: usize) -> RECT {
+        let p = tab.pages()[i];
+        let w = ((p.w as f32) * geo.f).round().max(1.0) as i32;
+        let h = ((p.h as f32) * geo.f).round().max(1.0) as i32;
+        let x = mm.left + (mm.right - mm.left - w) / 2;
+        let y = mm.top + (p.y as f32 * geo.f).round() as i32 - geo.offset;
+        rect(x, y, w, h)
+    }
+
+    /// Pages of `tab` that show in the minimap.
+    fn minimap_pages(&self, tab: &Tab, geo: &MiniGeo, mm: &RECT) -> std::ops::Range<usize> {
+        let top = (geo.offset as f32 / geo.f) as i32;
+        let bottom = ((geo.offset + mm.bottom - mm.top) as f32 / geo.f) as i32 + 1;
+        tab.pages_in(top, bottom)
+    }
+
+    /// Page of the active tab under a minimap point.
+    fn page_at(&self, x: i32, y: i32) -> Option<usize> {
+        let r = self.regions();
+        let tab = self.active_tab()?;
+        let geo = self.mini_geo(tab, &r.minimap, self.view_h());
+        self.minimap_pages(tab, &geo, &r.minimap)
+            .find(|&i| gdi::contains(&self.thumb_rect(tab, &geo, &r.minimap, i), x, y))
+    }
+
+    /// Where a page dropped at minimap height `y` goes: before the first page
+    /// whose middle is below the pointer.
+    fn insert_index_at(&self, y: i32) -> Option<usize> {
+        let r = self.regions();
+        let tab = self.active_tab()?;
+        let geo = self.mini_geo(tab, &r.minimap, self.view_h());
+        let content_y = ((y - r.minimap.top + geo.offset) as f32 / geo.f) as i32;
+        Some(tab.pages().iter().take_while(|p| p.y + p.h / 2 < content_y).count())
+    }
+
+    fn drop_target(&self, x: i32, y: i32) -> DropTarget {
+        match self.hit_test(x, y) {
+            Hit::Minimap => self.insert_index_at(y).map_or(DropTarget::Nothing, DropTarget::Minimap),
+            Hit::Tab(i) | Hit::TabClose(i) => DropTarget::Tab(i),
+            Hit::TabStrip => DropTarget::NewTab,
+            Hit::Editor if self.active_tab().is_none() => DropTarget::Tab(self.active), // welcome screen
+            _ => DropTarget::Nothing,
+        }
+    }
+
+    fn update_page_drag(&self, d: &mut PageDrag, x: i32, y: i32) {
+        d.x = x;
+        d.y = y;
+        d.copy = ctrl_down();
+        d.target = self.drop_target(x, y);
+        d.hover_tab = match d.target {
+            DropTarget::Tab(i) if i != self.active => match d.hover_tab {
+                Some((h, since)) if h == i => Some((h, since)),
+                _ => Some((i, Instant::now())),
+            },
+            _ => None,
+        };
+    }
+
+    // ---- page drag & drop ------------------------------------------------
+
+    fn doc_tab_mut(&mut self, i: usize) -> Option<&mut Tab> {
+        match self.tabs.get_mut(i) {
+            Some(Slot::Doc(tab)) => Some(tab),
+            _ => None,
+        }
+    }
+
+    /// Two different document tabs, mutably, in the order asked.
+    fn two_doc_tabs(&mut self, a: usize, b: usize) -> Option<(&mut Tab, &mut Tab)> {
+        if a == b || a.max(b) >= self.tabs.len() {
+            return None;
+        }
+        let (low, high) = self.tabs.split_at_mut(a.max(b));
+        let (first, last) = (&mut low[a.min(b)], &mut high[0]);
+        let (x, y) = if a < b { (first, last) } else { (last, first) };
+        match (x, y) {
+            (Slot::Doc(x), Slot::Doc(y)) => Some((x, y)),
+            _ => None,
+        }
+    }
+
+    fn drop_page(&mut self, d: PageDrag) -> Result<(), String> {
+        match d.target {
+            DropTarget::Nothing => Ok(()),
+            DropTarget::Minimap(at) => self.transfer(d, self.active, at),
+            DropTarget::Tab(i) => match self.tabs.get(i) {
+                Some(Slot::Doc(tab)) => {
+                    let at = tab.doc.page_count();
+                    self.transfer(d, i, at)?;
+                    self.activate(i);
+                    Ok(())
+                }
+                Some(Slot::Welcome) => self.extract(d, Some(i)),
+                None => Ok(()),
+            },
+            DropTarget::NewTab => self.extract(d, None),
+        }
+    }
+
+    /// Moves (Ctrl: copies) the dragged page into tab `to`, before index `at`.
+    fn transfer(&mut self, d: PageDrag, to: usize, at: usize) -> Result<(), String> {
+        if d.from == to {
+            let Some(tab) = self.doc_tab_mut(to) else { return Ok(()) };
+            if d.copy {
+                tab.doc.duplicate_page(d.page, at)?;
+            } else {
+                // `at` counts the page itself, so past it the final index is one less.
+                let dest = if at > d.page { at - 1 } else { at };
+                if dest == d.page {
+                    return Ok(());
+                }
+                tab.doc.move_page(d.page, dest)?;
+            }
+            tab.pages_changed();
+            return Ok(());
+        }
+        let Some((src, dst)) = self.two_doc_tabs(d.from, to) else { return Ok(()) };
+        check_can_take(src, d)?;
+        dst.doc.import_page(&src.doc, d.page, at)?;
+        dst.pages_changed();
+        if !d.copy {
+            src.doc.delete_page(d.page);
+            src.pages_changed();
+        }
+        Ok(())
+    }
+
+    /// Puts the dragged page in a new untitled document: into welcome tab
+    /// `slot`, or a new tab at the end.
+    fn extract(&mut self, d: PageDrag, slot: Option<usize>) -> Result<(), String> {
+        let Some(src) = self.doc_tab_mut(d.from) else { return Ok(()) };
+        check_can_take(src, d)?;
+        let doc = Document::from_page(&src.doc, d.page)?;
+        if !d.copy {
+            src.doc.delete_page(d.page);
+            src.pages_changed();
+        }
+        let mut tab = self.make_tab(doc);
+        tab.dirty = true;
+        match slot {
+            Some(i) => {
+                self.tabs[i] = Slot::Doc(tab);
+                self.activate(i);
+            }
+            None => {
+                self.tabs.push(Slot::Doc(tab));
+                self.activate(self.tabs.len() - 1);
+            }
+        }
+        Ok(())
+    }
+
     // ---- input -----------------------------------------------------------
 
     pub fn key(&mut self, key: VIRTUAL_KEY) -> Action {
+        if key == VK_ESCAPE && matches!(self.drag, Drag::Page(_) | Drag::PagePress { .. }) {
+            self.drag = Drag::None;
+            return Action::Release(None);
+        }
         let line = self.m.px(t::LINE_STEP);
         let page = self.view_h() - line;
         match key {
@@ -437,6 +675,7 @@ impl App {
     }
 
     pub fn mouse_move(&mut self, x: i32, y: i32) -> Action {
+        self.sync_layout();
         match self.drag {
             Drag::Minimap { grab } => {
                 let r = self.regions();
@@ -453,6 +692,28 @@ impl App {
                 let max = tab.max_scroll(view_h);
                 let pos = (y - grab - r.scrollbar.top) as i64 * max as i64 / travel.max(1) as i64;
                 return self.scroll_to(pos as i32);
+            }
+            Drag::PagePress { page, x: x0, y: y0 } => {
+                if (x - x0).abs().max((y - y0).abs()) < self.m.px(5) {
+                    return Action::None;
+                }
+                let mut d = PageDrag {
+                    from: self.active,
+                    page,
+                    x,
+                    y,
+                    copy: false,
+                    target: DropTarget::Nothing,
+                    hover_tab: None,
+                };
+                self.update_page_drag(&mut d, x, y);
+                self.drag = Drag::Page(d);
+                return Action::Redraw;
+            }
+            Drag::Page(mut d) => {
+                self.update_page_drag(&mut d, x, y);
+                self.drag = Drag::Page(d);
+                return Action::Redraw;
             }
             Drag::None => {}
         }
@@ -473,19 +734,21 @@ impl App {
     }
 
     pub fn left_down(&mut self, x: i32, y: i32) -> Action {
+        self.sync_layout();
         let r = self.regions();
         match self.hit_test(x, y) {
             Hit::MenuFile => Action::FileMenu(r.file_button.left, r.file_button.bottom),
-            Hit::TabClose(i) => {
-                self.close_tab(i);
-                self.hover = self.hit_test(x, y);
-                Action::Redraw
-            }
+            Hit::TabClose(i) => Action::CloseTab(i),
             Hit::Tab(i) => {
                 self.activate(i);
                 Action::Redraw
             }
             Hit::Minimap => {
+                if let Some(page) = self.page_at(x, y) {
+                    self.drag = Drag::PagePress { page, x, y };
+                    return Action::Capture;
+                }
+                // Between pages: scrub like VS Code's minimap.
                 let view_h = self.view_h();
                 let Some(tab) = self.active_tab() else { return Action::None };
                 let geo = self.mini_geo(tab, &r.minimap, view_h);
@@ -518,21 +781,69 @@ impl App {
 
     pub fn middle_down(&mut self, x: i32, y: i32) -> Action {
         match self.hit_test(x, y) {
-            Hit::Tab(i) | Hit::TabClose(i) => {
-                self.close_tab(i);
-                self.hover = self.hit_test(x, y);
-                Action::Redraw
-            }
+            Hit::Tab(i) | Hit::TabClose(i) => Action::CloseTab(i),
             _ => Action::None,
         }
     }
 
+    /// After a tab closes, re-evaluate what's under the pointer.
+    pub fn rehover(&mut self, x: i32, y: i32) {
+        self.hover = self.hit_test(x, y);
+    }
+
     pub fn left_up(&mut self) -> Action {
-        if self.drag == Drag::None {
-            return Action::None;
+        self.sync_layout();
+        match std::mem::replace(&mut self.drag, Drag::None) {
+            Drag::None => Action::None,
+            Drag::PagePress { page, .. } => {
+                // A click on a page: bring it to the top of the view.
+                let margin = self.m.px(t::PAGE_MARGIN);
+                if let Some(y) = self.active_tab().and_then(|tab| tab.pages().get(page)).map(|p| p.y) {
+                    self.scroll_to(y - margin);
+                }
+                Action::Release(None)
+            }
+            Drag::Page(d) => Action::Release(self.drop_page(d).err()),
+            Drag::Minimap { .. } | Drag::Scrollbar { .. } => Action::Release(None),
         }
-        self.drag = Drag::None;
-        Action::Release
+    }
+
+    /// Runs on a timer while the mouse is captured: switches to a tab the
+    /// dragged page rests on, auto-scrolls near the minimap's ends, and
+    /// picks up Ctrl (copy) being pressed or released.
+    pub fn tick(&mut self) -> Action {
+        let Drag::Page(mut d) = self.drag else { return Action::None };
+        let before = d;
+        let mut moved = false;
+        if let Some((i, since)) = d.hover_tab {
+            if since.elapsed() >= SPRING_LOAD && i != self.active {
+                self.activate(i);
+                self.sync_layout();
+                moved = true;
+            }
+        }
+        let mm = self.regions().minimap;
+        if d.x >= mm.left && d.x < mm.right && d.y >= mm.top && d.y < mm.bottom {
+            let zone = self.m.px(40);
+            let dy = if d.y < mm.top + zone {
+                d.y - (mm.top + zone)
+            } else if d.y >= mm.bottom - zone {
+                d.y - (mm.bottom - zone)
+            } else {
+                0
+            };
+            if dy != 0 && matches!(self.scroll_by(dy * 3), Action::Redraw) {
+                moved = true;
+            }
+        }
+        let (x, y) = (d.x, d.y);
+        self.update_page_drag(&mut d, x, y);
+        self.drag = Drag::Page(d);
+        if moved || d.copy != before.copy || d.target != before.target {
+            Action::Redraw
+        } else {
+            Action::None
+        }
     }
 
     /// Mouse capture was taken away (alt-tab, etc.).
@@ -562,7 +873,33 @@ impl App {
         }
         self.paint_menu(dc, &r);
         self.paint_status(dc, &r);
+        self.paint_drag_ghost(dc);
         unsafe { let _ = BitBlt(screen, 0, 0, w, h, Some(dc), 0, 0, SRCCOPY); }
+    }
+
+    /// The dragged page, following the pointer.
+    fn paint_drag_ghost(&self, dc: HDC) {
+        let Drag::Page(d) = self.drag else { return };
+        let Some(Slot::Doc(src)) = self.tabs.get(d.from) else { return };
+        let m = self.m;
+        let (pw, ph) = src.doc.page_sizes.get(d.page).copied().unwrap_or((612.0, 792.0));
+        let w = m.px(72);
+        let h = (w as f32 * ph / pw) as i32;
+        // Below-right of the pointer, flipped left/up where it would leave the window.
+        let (gap, (cw, ch)) = (m.px(14), self.size);
+        let x = if d.x + gap + w > cw { d.x - gap - w } else { d.x + gap };
+        let y = if d.y + gap + h > ch { d.y - gap - h } else { d.y + gap };
+        let border = rect(x - 2, y - 2, w + 4, h + 4);
+        gdi::fill(dc, &border, if d.target == DropTarget::Nothing { t::TEXT_FAINT } else { t::ACCENT });
+        match src.cached_thumb(d.page) {
+            Some(bmp) => gdi::blit(dc, bmp, x, y, w, h),
+            None => gdi::fill(dc, &rect(x, y, w, h), t::WHITE),
+        }
+        if d.copy {
+            let badge = rect(x - m.px(9), y - m.px(9), m.px(18), m.px(18));
+            gdi::round_fill(dc, &badge, m.px(18), t::ACCENT);
+            gdi::text(dc, self.fonts.ui, t::TEXT_BRIGHT, "+", badge, DT_CENTER | DT_VCENTER);
+        }
     }
 
     fn paint_pages(&mut self, dc: HDC, r: &Regions) {
@@ -595,24 +932,54 @@ impl App {
         let Some(tab) = self.active_tab() else { return };
         let geo = self.mini_geo(tab, &mm, view_h);
         gdi::fill(dc, &mm, t::EDITOR_BG);
+        let visible = self.minimap_pages(tab, &geo, &mm);
+        let rects: Vec<RECT> = visible.clone().map(|i| self.thumb_rect(tab, &geo, &mm, i)).collect();
+        // During a page drag: dim the page being moved, and mark where it would land.
+        let (mut dim, mut marker) = (None, None);
+        if let Drag::Page(d) = self.drag {
+            let here = d.from == self.active;
+            if here && !d.copy {
+                dim = visible.clone().position(|i| i == d.page).map(|k| rects[k]);
+            }
+            if let DropTarget::Minimap(at) = d.target {
+                let no_op = here && !d.copy && (at == d.page || at == d.page + 1);
+                if !no_op {
+                    // Midway between page `at - 1` and page `at`.
+                    let pages = tab.pages();
+                    let half_gap = self.m.px(t::PAGE_GAP) / 2;
+                    let content_y = match (at.checked_sub(1).and_then(|i| pages.get(i)), pages.get(at)) {
+                        (Some(a), Some(b)) => (a.y + a.h + b.y) / 2,
+                        (Some(a), None) => a.y + a.h + half_gap,
+                        (None, Some(b)) => b.y - half_gap,
+                        (None, None) => 0,
+                    };
+                    let y = mm.top + (content_y as f32 * geo.f).round() as i32 - geo.offset;
+                    let pad = self.m.px(6);
+                    marker = Some(rect(mm.left + pad, y - self.m.px(2), mm.right - mm.left - 2 * pad, self.m.px(3)));
+                }
+            }
+        }
+        let dragging = matches!(self.drag, Drag::Page(_));
 
         let Some(tab) = self.active_tab_mut() else { return };
-        let top = (geo.offset as f32 / geo.f) as i32;
-        let bottom = ((geo.offset + mm.bottom - mm.top) as f32 / geo.f) as i32 + 1;
-        let visible = tab.pages_in(top, bottom);
-        for i in visible.clone() {
-            let p = tab.pages()[i];
-            let (tw, th) = (((p.w as f32) * geo.f).round().max(1.0) as i32, ((p.h as f32) * geo.f).round().max(1.0) as i32);
-            let x = mm.left + (mm.right - mm.left - tw) / 2;
-            let y = mm.top + (p.y as f32 * geo.f).round() as i32 - geo.offset;
-            match tab.thumb(i, tw, true) {
-                Some(bmp) => gdi::blit(dc, bmp, x, y, tw, th),
-                None => gdi::fill(dc, &rect(x, y, tw, th), t::WHITE),
+        for (i, r) in visible.clone().zip(&rects) {
+            match tab.thumb(i, r.right - r.left, true) {
+                Some(bmp) => gdi::blit(dc, bmp, r.left, r.top, r.right - r.left, r.bottom - r.top),
+                None => gdi::fill(dc, r, t::WHITE),
             }
         }
         let pages = tab.pages_in(tab.scroll_y, tab.scroll_y + view_h);
         tab.evict(pages, visible); // both caches, now that both views are drawn
-        self.tint.fill(dc, &geo.slider, t::SLIDER, alpha);
+
+        if let Some(r) = dim {
+            self.tint.fill(dc, &r, t::EDITOR_BG, 0xB0);
+        }
+        if let Some(r) = marker {
+            gdi::fill(dc, &r, t::ACCENT);
+        }
+        if !dragging {
+            self.tint.fill(dc, &geo.slider, t::SLIDER, alpha);
+        }
     }
 
     fn paint_scrollbar(&self, dc: HDC, r: &Regions) {
@@ -658,13 +1025,47 @@ impl App {
             let color = if active { t::TEXT_BRIGHT } else { t::TEXT_DIM };
             gdi::text(dc, self.fonts.ui, color, &self.tabs[i].name(), label, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
-            if active || hovered {
-                if self.hover == Hit::TabClose(i) {
-                    gdi::round_fill(dc, &close, m.px(5), t::HOVER_BG);
-                }
+            // VS Code: unsaved tabs show ● where the × goes, until hovered.
+            let dirty = matches!(&self.tabs[i], Slot::Doc(tab) if tab.dirty);
+            if self.hover == Hit::TabClose(i) {
+                gdi::round_fill(dc, &close, m.px(5), t::HOVER_BG);
+            }
+            if dirty && self.hover != Hit::TabClose(i) {
+                let c = m.px(8);
+                let dot = rect((close.left + close.right - c) / 2, (close.top + close.bottom - c) / 2, c, c);
+                gdi::round_fill(dc, &dot, c, color);
+            } else if active || hovered {
                 gdi::text(dc, self.fonts.icon_small, color, t::ICON_CLOSE, close, DT_CENTER | DT_VCENTER);
             }
+
+            if matches!(self.drag, Drag::Page(d) if d.target == DropTarget::Tab(i)) {
+                self.outline(dc, &tr, t::ACCENT);
+            }
         }
+
+        // Empty strip right of the tabs: drop a page here for a new document.
+        if let Drag::Page(d) = self.drag {
+            let end = self.tab_rects(&strip).last().map_or(strip.left, |(r, _)| r.right);
+            if end < strip.right {
+                let area = RECT { left: end, ..strip };
+                let on = d.target == DropTarget::NewTab;
+                if on {
+                    gdi::fill(dc, &area, t::HOVER_BG);
+                    self.outline(dc, &area, t::ACCENT);
+                }
+                let label = RECT { left: end + m.px(12), ..strip };
+                gdi::text(dc, self.fonts.ui, if on { t::TEXT } else { t::TEXT_FAINT }, "+ New document", label, DT_LEFT | DT_VCENTER);
+            }
+        }
+    }
+
+    fn outline(&self, dc: HDC, r: &RECT, color: windows::Win32::Foundation::COLORREF) {
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let s = self.m.px(2);
+        gdi::fill(dc, &rect(r.left, r.top, w, s), color);
+        gdi::fill(dc, &rect(r.left, r.bottom - s, w, s), color);
+        gdi::fill(dc, &rect(r.left, r.top, s, h), color);
+        gdi::fill(dc, &rect(r.right - s, r.top, s, h), color);
     }
 
     fn paint_menu(&self, dc: HDC, r: &Regions) {
@@ -680,8 +1081,17 @@ impl App {
         let s = r.status;
         gdi::fill(dc, &s, t::CHROME_BG);
         gdi::fill(dc, &rect(0, s.top, s.right, 1), t::BORDER);
-        let Some(tab) = self.active_tab() else { return };
         let pad = self.m.px(12);
+        if let Drag::Page(d) = self.drag {
+            let verb = if d.copy { "Copying" } else { "Moving" };
+            let hint = format!(
+                "{verb} page {}  ·  drop in the page strip, on a tab, or on the empty tab bar  ·  Ctrl: copy  ·  Esc: cancel",
+                d.page + 1
+            );
+            gdi::text(dc, self.fonts.status, t::TEXT, &hint, RECT { left: pad, ..s }, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
         let view_h = r.editor.bottom - r.editor.top;
         let current = tab.current_page(view_h);
         let left = format!("Page {} of {}", current + 1, tab.doc.page_count());

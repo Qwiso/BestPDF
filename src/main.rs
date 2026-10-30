@@ -4,6 +4,7 @@
 mod dialog;
 mod document;
 mod gdi;
+mod pdfium;
 mod print;
 mod tab;
 mod theme;
@@ -45,6 +46,8 @@ const ID_EXIT: u16 = 106;
 const ID_NEXT_TAB: u16 = 107;
 const ID_PREV_TAB: u16 = 108;
 const ID_NEW_TAB: u16 = 109;
+/// Timer that drives page drags (spring-loaded tabs, auto-scroll).
+const DRAG_TIMER: usize = 1;
 /// Commands that need a document in the active tab; greyed out otherwise.
 const DOC_COMMANDS: [u16; 3] = [ID_SAVE, ID_SAVE_AS, ID_PRINT];
 
@@ -300,6 +303,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             perform(hwnd, with_app(|a| a.key(VIRTUAL_KEY(wparam.0 as u16))));
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == DRAG_TIMER => {
+            perform(hwnd, with_app(|a| a.tick()));
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            // Ask about every tab with unsaved changes before quitting.
+            while let Some(i) = with_app(|a| a.first_unsaved()).flatten() {
+                if !close_tab(hwnd, i) {
+                    return LRESULT(0); // cancelled
+                }
+            }
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
         WM_SYSCHAR if matches!(wparam.0 as u8, b'f' | b'F') => {
             if let Some((x, y)) = with_app(|a| a.file_menu_point()) {
                 show_file_menu(hwnd, x, y);
@@ -366,12 +383,49 @@ fn perform(hwnd: HWND, action: Option<Action>) {
         match action {
             None | Some(Action::None) => return,
             Some(Action::Redraw) => {}
-            Some(Action::Capture) => { SetCapture(hwnd); }
-            Some(Action::Release) => { let _ = ReleaseCapture(); }
+            Some(Action::Capture) => {
+                SetCapture(hwnd);
+                SetTimer(Some(hwnd), DRAG_TIMER, 30, None);
+            }
+            Some(Action::Release(error)) => {
+                let _ = KillTimer(Some(hwnd), DRAG_TIMER);
+                let _ = ReleaseCapture();
+                refresh(hwnd);
+                if let Some(e) = error {
+                    error_box(hwnd, &e);
+                }
+                return;
+            }
             Some(Action::FileMenu(x, y)) => return show_file_menu(hwnd, x, y),
+            Some(Action::CloseTab(i)) => {
+                close_tab(hwnd, i);
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                with_app(|a| a.rehover(pt.x, pt.y));
+            }
         }
     }
     refresh(hwnd);
+}
+
+/// Closes tab `i`, first offering to save unsaved changes.
+/// Returns false if the user cancelled (or saving failed).
+fn close_tab(hwnd: HWND, i: usize) -> bool {
+    if let Some(name) = with_app(|a| a.unsaved_name(i)).flatten() {
+        with_app(|a| a.activate(i)); // Save acts on the active tab
+        refresh(hwnd);
+        let text = HSTRING::from(format!("Do you want to save the changes you made to {name}?"));
+        let choice = unsafe { MessageBoxW(Some(hwnd), &text, w!("Best PDF"), MB_YESNOCANCEL | MB_ICONWARNING) };
+        match choice {
+            IDYES if !save_active(hwnd) => return false,
+            IDYES | IDNO => {}
+            _ => return false,
+        }
+    }
+    with_app(|a| a.close_tab(i));
+    refresh(hwnd);
+    true
 }
 
 fn refresh(hwnd: HWND) {
@@ -417,21 +471,22 @@ fn on_command(hwnd: HWND, id: u16) {
             open_paths(hwnd, paths);
         }
         ID_CLOSE => {
-            with_app(|a| a.close_active());
-            refresh(hwnd);
+            if let Some(i) = with_app(|a| a.has_tabs().then(|| a.active_index())).flatten() {
+                close_tab(hwnd, i);
+            }
         }
-        ID_SAVE => match with_app(|a| a.active_tab().map(|t| t.doc.path.clone())).flatten() {
-            Some(Some(path)) => save_to(hwnd, &path),
-            Some(None) => prompt_save_as(hwnd), // untitled
-            None => {}
-        },
-        ID_SAVE_AS => prompt_save_as(hwnd),
+        ID_SAVE => {
+            save_active(hwnd);
+        }
+        ID_SAVE_AS => {
+            prompt_save_as(hwnd);
+        }
         ID_PRINT => print_document(hwnd),
         ID_NEXT_TAB | ID_PREV_TAB => {
             with_app(|a| a.cycle_tab(id == ID_NEXT_TAB));
             refresh(hwnd);
         }
-        ID_EXIT => unsafe { let _ = DestroyWindow(hwnd); },
+        ID_EXIT => unsafe { let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)); },
         _ => {}
     }
 }
@@ -454,19 +509,43 @@ fn open_paths(hwnd: HWND, paths: Vec<PathBuf>) {
     }
 }
 
-fn prompt_save_as(hwnd: HWND) {
-    let Some(name) = with_app(|a| a.active_tab().map(|t| t.name())).flatten() else { return };
-    let suggested = if name.to_ascii_lowercase().ends_with(".pdf") { name } else { format!("{name}.pdf") };
-    if let Some(path) = dialog::save_pdf(hwnd, &suggested) {
-        save_to(hwnd, &path);
+/// Saves the active tab in place (Save As if untitled). Returns true if saved.
+fn save_active(hwnd: HWND) -> bool {
+    match with_app(|a| a.active_tab().map(|t| t.doc.path.clone())).flatten() {
+        Some(Some(path)) => save_to(hwnd, &path),
+        Some(None) => prompt_save_as(hwnd),
+        None => false,
     }
 }
 
-fn save_to(hwnd: HWND, path: &Path) {
-    let result = with_app(|a| a.active_tab_mut().map(|t| t.doc.save_as(path))).flatten();
+fn prompt_save_as(hwnd: HWND) -> bool {
+    let Some(name) = with_app(|a| a.active_tab().map(|t| t.name())).flatten() else { return false };
+    let suggested = if name.to_ascii_lowercase().ends_with(".pdf") { name } else { format!("{name}.pdf") };
+    match dialog::save_pdf(hwnd, &suggested) {
+        Some(path) => save_to(hwnd, &path),
+        None => false,
+    }
+}
+
+fn save_to(hwnd: HWND, path: &Path) -> bool {
+    let result = with_app(|a| {
+        a.active_tab_mut().map(|t| {
+            let r = t.doc.save_as(path);
+            if r.is_ok() {
+                t.dirty = false;
+            }
+            r
+        })
+    })
+    .flatten();
     refresh(hwnd); // tab name may change (Untitled-1 → file name)
-    if let Some(Err(e)) = result {
-        error_box(hwnd, &e);
+    match result {
+        Some(Ok(())) => true,
+        Some(Err(e)) => {
+            error_box(hwnd, &e);
+            false
+        }
+        None => false,
     }
 }
 
@@ -479,7 +558,7 @@ fn print_document(hwnd: HWND) {
     let result = bytes.and_then(|bytes| {
         // Dialog first (modal, re-enters wnd_proc), then spool with a busy cursor.
         let cursor = unsafe { SetCursor(LoadCursorW(None, IDC_WAIT).ok()) };
-        let r = print::print(hwnd, &title, &bytes, pages);
+        let r = print::print(hwnd, &title, bytes, pages);
         unsafe { SetCursor(Some(cursor)); }
         r
     });

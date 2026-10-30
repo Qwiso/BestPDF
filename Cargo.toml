@@ -3,9 +3,6 @@ name = "best-pdf"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_7881", "thread_safe"] }
-
 [build-dependencies]
 embed-resource = "3.0.12"
 
